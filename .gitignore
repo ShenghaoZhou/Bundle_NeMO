@@ -141,3 +141,12 @@ data/
 logs/
 !BundleTrack/XMem/inference/data
 run_used.yml
+
+# Outputs and large 3D recordings
+outputs/
+*.rrd
+*.ply
+*.obj
+*.tar.gz
+*.pth
+
