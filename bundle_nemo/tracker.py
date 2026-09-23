@@ -19,11 +19,13 @@ from nemolib.utils import image_to_tensor
 def crop_masked_object(
     rgb_img: np.ndarray,
     binary_mask: np.ndarray,
+    foreground_mask: Optional[np.ndarray] = None,
     padding_ratio: float = 0.15,
     crop_size: int = 224
 ) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
     """
     Extract tightly bounded foreground crop on white canvas for NeMO input.
+    Uses binary_mask (amodal) for bounding box and foreground_mask (modal) for canvas isolation.
     
     Returns:
         crop_pil: (crop_size, crop_size) RGB PIL image.
@@ -57,7 +59,11 @@ def crop_masked_object(
 
     # White canvas background
     canvas = np.ones((crop_rgb.shape[0], crop_rgb.shape[1], 3), dtype=np.uint8) * 255
-    fg_mask = (crop_mask > 0)[..., None]
+    if foreground_mask is not None:
+        crop_fg = foreground_mask[ny1:ny2, nx1:nx2]
+        fg_mask = (crop_fg > 0)[..., None]
+    else:
+        fg_mask = (crop_mask > 0)[..., None]
     canvas = np.where(fg_mask, crop_rgb, canvas)
 
     crop_pil = Image.fromarray(canvas).resize((crop_size, crop_size), Image.Resampling.LANCZOS)
@@ -114,12 +120,13 @@ class BundleNeMOTracker:
         depth_map: Optional[np.ndarray],
         binary_mask: np.ndarray,
         K: np.ndarray,
-        R_cam_obj_init: Optional[np.ndarray] = None
+        R_cam_obj_init: Optional[np.ndarray] = None,
+        foreground_mask: Optional[np.ndarray] = None
     ) -> Dict[str, Any]:
         """
         Initialize the tracker with the initial frame observation.
         """
-        crop_pil, crop_box = crop_masked_object(rgb_img, binary_mask)
+        crop_pil, crop_box = crop_masked_object(rgb_img, binary_mask, foreground_mask=foreground_mask)
         self.keyframe_crops_buffer = [crop_pil]
 
         if R_cam_obj_init is None:
@@ -181,18 +188,20 @@ class BundleNeMOTracker:
             pts2d_pixels=pts2d_full,
             conf_weights=conf_valid,
             T_cam_obj_pnp=T_pnp,
-            pnp_valid=success
+            pnp_valid=success,
+            inliers=inliers
         )
         T_cam_obj = opt_res['T_cam_obj']
         self.last_T_cam_obj = T_cam_obj.copy()
 
-        # Register Anchor Node 0 in Keyframe Pose Graph
+        # Register Anchor Node 0 in Keyframe Pose Graph (filter to inliers)
+        sub_inl = inliers if (inliers is not None and len(inliers) >= 30) else np.arange(len(pts3d_cand))
         self.pose_graph.add_keyframe(
             frame_idx=0,
             T_cam_obj_init=T_cam_obj,
-            pts3d_canon=pts3d_cand,
-            pts2d_pixels=pts2d_full,
-            conf_weights=conf_valid,
+            pts3d_canon=pts3d_cand[sub_inl],
+            pts2d_pixels=pts2d_full[sub_inl],
+            conf_weights=conf_valid[sub_inl],
             K=K
         )
 
@@ -223,14 +232,15 @@ class BundleNeMOTracker:
         depth_map: Optional[np.ndarray],
         binary_mask: np.ndarray,
         K: np.ndarray,
-        R_cam_obj_gt: Optional[np.ndarray] = None
+        R_cam_obj_gt: Optional[np.ndarray] = None,
+        foreground_mask: Optional[np.ndarray] = None
     ) -> Dict[str, Any]:
         """
         Process incoming video frame:
-        1. Crop foreground.
+        1. Crop foreground with optional modal mask.
         2. Decode across memory bank.
         3. Solve SQPnP initial pose.
-        4. Refine pose with sliding-window optimizer.
+        4. Refine pose with inlier-filtered sliding-window optimizer.
         5. Check keyframe condition & add new memory cluster if needed.
         6. Fuse observed points into canonical 3D model.
         """
@@ -255,7 +265,7 @@ class BundleNeMOTracker:
                 'fps': 1.0 / max(1e-4, elapsed)
             }
 
-        crop_pil, crop_box = crop_masked_object(rgb_img, binary_mask)
+        crop_pil, crop_box = crop_masked_object(rgb_img, binary_mask, foreground_mask=foreground_mask)
 
         # 1. NeMO Decode across memory bank
         dec_out, best_cluster_idx = self.memory_bank.decode_query(crop_pil)
@@ -278,14 +288,15 @@ class BundleNeMOTracker:
             pts3d_cand, pts2d_full, K
         )
 
-        # 4. Refine with Optimizer
+        # 4. Refine with Optimizer (strictly on verified geometric inliers)
         opt_res = self.optimizer.optimize_step(
             K=K,
             pts3d_canon=pts3d_cand,
             pts2d_pixels=pts2d_full,
             conf_weights=conf_valid,
             T_cam_obj_pnp=T_pnp,
-            pnp_valid=success
+            pnp_valid=success,
+            inliers=inliers
         )
         T_cam_obj = opt_res['T_cam_obj']
         self.last_T_cam_obj = T_cam_obj.copy()
@@ -307,12 +318,13 @@ class BundleNeMOTracker:
                 R_k_to_0 = self.memory_bank.R_ref0 @ R_kf.T
             elif self.alignment_mode == "pose_graph":
                 # Method C: BundleSDF-Style Keyframe Pose Graph Optimization & Multi-View BA
+                sub_inl = inliers if (inliers is not None and len(inliers) >= 30) else np.arange(len(pts3d_cand))
                 node_id = self.pose_graph.add_keyframe(
                     frame_idx=self.frame_count,
                     T_cam_obj_init=T_cam_obj,
-                    pts3d_canon=pts3d_cand,
-                    pts2d_pixels=pts2d_full,
-                    conf_weights=conf_valid,
+                    pts3d_canon=pts3d_cand[sub_inl],
+                    pts2d_pixels=pts2d_full[sub_inl],
+                    conf_weights=conf_valid[sub_inl],
                     K=K
                 )
                 opt_poses = self.pose_graph.optimize()

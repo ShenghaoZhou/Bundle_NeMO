@@ -17,11 +17,13 @@ import torch
 import open3d as o3d
 from PIL import Image
 
-# Ensure local nemolib and bundle_nemo are accessible
+# Ensure self-contained NeMO submodule and bundle_nemo are accessible
 current_dir = os.path.dirname(os.path.realpath(__file__))
-workspace_root = os.path.dirname(current_dir)
-sys.path.insert(0, os.path.join(workspace_root, "nemo", "src"))
-sys.path.insert(0, current_dir)
+submodule_nemo_src = os.path.join(current_dir, "NeMO", "src")
+if os.path.isdir(submodule_nemo_src) and submodule_nemo_src not in sys.path:
+    sys.path.insert(0, submodule_nemo_src)
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
 
 from nemolib.model import Model
 from bundle_nemo import BundleNeMOTracker
@@ -118,13 +120,16 @@ def read_frame_data(frame_info):
             toy = obj_data[key][0]
             mask_rle = toy['masks_amodal']['214-1']
             mask = decode_binary_mask_rle(mask_rle)
+            mask_modal = None
+            if 'masks_modal' in toy and '214-1' in toy['masks_modal']:
+                mask_modal = decode_binary_mask_rle(toy['masks_modal']['214-1'])
             if 'T_world_from_object' in toy:
                 T_w_obj_gt = np.eye(4, dtype=np.float64)
                 T_w_obj_gt[:3, :3] = quat_to_rot(toy['T_world_from_object']['quaternion_wxyz'])
                 T_w_obj_gt[:3, 3] = toy['T_world_from_object']['translation_xyz']
 
         depth = None
-        return rgb, depth, mask, K, T_w_cam, T_w_obj_gt
+        return rgb, depth, mask, K, T_w_cam, T_w_obj_gt, mask_modal
 
     elif frame_info['type'] == 'rgbd':
         rgb = cv2.imread(frame_info['rgb_path'])[:, :, ::-1]
@@ -133,14 +138,14 @@ def read_frame_data(frame_info):
         if mask is not None:
             mask = (mask > 0).astype(np.uint8)
         K = frame_info['K']
-        return rgb, depth, mask, K, None, None
+        return rgb, depth, mask, K, None, None, None
 
 
 def main():
     parser = argparse.ArgumentParser(description="BundleNeMO 6-DoF Object Tracking and Reconstruction")
     parser.add_argument("--data_dir", type=str, default="../data/hot3d/extracted/clip-003312",
                         help="Path to dataset sequence directory")
-    parser.add_argument("--checkpoint", type=str, default="../nemo/checkpoints/checkpoint.pth",
+    parser.add_argument("--checkpoint", type=str, default="NeMO/checkpoints/checkpoint.pth",
                         help="Path to NeMO model checkpoint")
     parser.add_argument("--out_dir", type=str, default="outputs/bundle_nemo_run",
                         help="Path to output directory")
@@ -210,7 +215,7 @@ def main():
 
     # 4. Sequential Tracking Loop
     for idx, f_info in enumerate(frames):
-        rgb, depth, mask, K, T_w_cam, T_w_obj_gt = read_frame_data(f_info)
+        rgb, depth, mask, K, T_w_cam, T_w_obj_gt, mask_modal = read_frame_data(f_info)
 
         R_c_o_gt = None
         if T_w_cam is not None and T_w_obj_gt is not None:
@@ -218,9 +223,9 @@ def main():
             R_c_o_gt = T_c_o_gt[:3, :3]
 
         if idx == 0:
-            res = tracker.process_first_frame(rgb, depth, mask, K, R_cam_obj_init=R_c_o_gt)
+            res = tracker.process_first_frame(rgb, depth, mask, K, R_cam_obj_init=R_c_o_gt, foreground_mask=mask_modal)
         else:
-            res = tracker.process_frame(rgb, depth, mask, K, R_cam_obj_gt=R_c_o_gt)
+            res = tracker.process_frame(rgb, depth, mask, K, R_cam_obj_gt=R_c_o_gt, foreground_mask=mask_modal)
 
         T_cam_obj = res['T_cam_obj']
         trajectory.append(T_cam_obj)

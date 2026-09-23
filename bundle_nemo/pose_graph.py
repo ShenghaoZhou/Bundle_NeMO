@@ -59,6 +59,21 @@ class KeyframePoseGraph:
                 'weight': 5.0
             })
 
+            # Check loop closure constraint with anchor keyframe 0
+            if node_id > 1:
+                T0_inv = np.linalg.inv(self.keyframes[0]['T_init'])
+                T_rel0 = T_cam_obj_init @ T0_inv
+                R_rel0 = T_rel0[:3, :3]
+                tr0 = np.clip((np.trace(R_rel0) - 1.0) / 2.0, -1.0, 1.0)
+                ang0 = float(np.rad2deg(np.arccos(tr0)))
+                if ang0 < 55.0:
+                    self.relative_edges.append({
+                        'from': 0,
+                        'to': node_id,
+                        'T_rel': torch.tensor(T_rel0, dtype=torch.float32, device=self.device),
+                        'weight': 3.5
+                    })
+
         return node_id
 
     def optimize(

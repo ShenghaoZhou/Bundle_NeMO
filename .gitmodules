@@ -1,0 +1,3 @@
+[submodule "NeMO"]
+	path = NeMO
+	url = https://github.com/ShenghaoZhou/NeMO.git

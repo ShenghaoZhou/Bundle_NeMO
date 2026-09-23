@@ -24,13 +24,13 @@ By replacing both pairwise feature matching (**LoFTR**) and implicit neural radi
 | :--- | :--- | :--- | :--- |
 | **Ground Truth Reliance** | Oracle Reference | **0% (Autonomous)** | **0% (Autonomous)** |
 | **PnP Tracking Success** | 100% (150/150) | **100% (150/150)** | **100% (150/150)** |
-| **Mutual Tie Points / Cluster** | N/A (GT lookup) | **5,279 – 9,799 inliers** | Multi-view BA factors |
-| **Translation RMSE** | 13.41 cm | **12.53 cm** | **12.78 cm** |
-| **Mean Rotation Error vs GT** | 24.58° | 77.27° | **64.36°** |
-| **Fused Canonical Points** | 13,796 | 19,059 | 17,699 |
-| **Poisson Mesh Faces** | 67,287 | 93,202 | 79,608 |
-| **Bounding Box Extent (cm)** | $17.1 \times 22.2 \times 15.7$ | $23.2 \times 19.3 \times 22.2$ | **$24.3 \times 19.3 \times 18.9$** |
-| **Throughput (Stride 1)** | 13.7 FPS | 10.3 FPS | 10.4 FPS |
+| **Mutual Tie Points / Cluster** | N/A (GT lookup) | **2,409 – 11,254 inliers** | Multi-view BA factors + Loop Closure |
+| **Translation RMSE** | 13.14 cm | **12.95 cm** | **12.56 cm** |
+| **Mean Rotation Error vs GT** | 31.32° | **33.73°** (was 77.27°) | **29.97°** (was 64.36°) |
+| **Median Rotation Error vs GT**| 33.41° | **33.64°** (was 78.85°) | **25.34°** (was 74.41°) |
+| **Fused Canonical Points** | 13,796 | 16,844 | 16,260 |
+| **Poisson Mesh Faces** | 67,287 | 74,771 | 77,373 |
+| **Throughput (Stride 1)** | 13.7 FPS | 10.0 FPS | 10.5 FPS |
 | **Throughput (Stride 2)** | **>27 FPS** | **>27 FPS** | **>27 FPS** |
 
 ---
@@ -39,6 +39,9 @@ By replacing both pairwise feature matching (**LoFTR**) and implicit neural radi
 
 ```
 BundleSDF/
+├── NeMO/                    # Git Submodule (ShenghaoZhou/NeMO)
+│   ├── src/nemolib/         # NeMO neural backbone library
+│   └── checkpoints/         # Pretrained model weights (checkpoint.pth)
 ├── bundle_nemo/
 │   ├── __init__.py
 │   ├── memory_bank.py       # AlignedDynamicNeMOMemoryBank (clusters, multi-aspect features)
@@ -55,13 +58,22 @@ BundleSDF/
 
 ---
 
-## Quick Start
+## Setup & Quick Start
 
-### 1. Run Autonomous Tracking (Method A + B, Zero-GT)
+### 1. Initialize Git Submodules & Checkpoint
+```bash
+# Initialize NeMO submodule
+git submodule update --init --recursive
+
+# Reconstruct checkpoint if needed
+cat NeMO/checkpoints/part_* > NeMO/checkpoints/checkpoint.pth
+```
+
+### 2. Run Autonomous Tracking (Method A + B, Zero-GT)
 ```bash
 python run_bundle_nemo.py \
     --data_dir /path/to/sequence \
-    --checkpoint /path/to/nemo_checkpoint.pth \
+    --checkpoint NeMO/checkpoints/checkpoint.pth \
     --out_dir outputs/run_cross_icp \
     --alignment_mode cross_icp \
     --save_rrd outputs/run_cross_icp/recording.rrd

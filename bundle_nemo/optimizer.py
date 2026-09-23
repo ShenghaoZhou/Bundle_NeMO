@@ -84,15 +84,15 @@ def project_points(K: torch.Tensor, pts_cam: torch.Tensor, eps: float = 0.05) ->
 
 class KinematicStateFilter:
     """
-    Causal Kinematic Filter for 6-DoF Trajectory.
+    Causal Kinematic Filter for 6-DoF Trajectory with Constant-Velocity Prior.
     Eliminates high-frequency PnP noise and angular jitter while preventing runaway drift.
     """
     def __init__(
         self,
-        max_jump_m: float = 0.045,
-        max_step_rot_deg: float = 25.0,
-        alpha_pos: float = 0.70,
-        alpha_rot: float = 0.70
+        max_jump_m: float = 0.055,
+        max_step_rot_deg: float = 35.0,
+        alpha_pos: float = 0.75,
+        alpha_rot: float = 0.75
     ):
         self.max_jump_m = max_jump_m
         self.max_step_rot_deg = max_step_rot_deg
@@ -100,6 +100,8 @@ class KinematicStateFilter:
         self.alpha_rot = alpha_rot
         self.pos: Optional[np.ndarray] = None
         self.rot: Optional[np.ndarray] = None
+        self.vel_pos: np.ndarray = np.zeros(3, dtype=np.float64)
+        self.vel_rot: np.ndarray = np.eye(3, dtype=np.float64)
         self.initialized = False
         self.spike_count = 0
 
@@ -120,6 +122,9 @@ class KinematicStateFilter:
             T_out[:3, :3] = self.rot
             T_out[:3, 3] = self.pos
             return {'T_cam_obj': T_out, 'is_spike': False, 'total_spikes': 0}
+
+        old_pos = self.pos.copy()
+        old_rot = self.rot.copy()
 
         if valid and T_cam_obj_meas is not None:
             p_meas = T_cam_obj_meas[:3, 3].astype(np.float64)
@@ -160,8 +165,17 @@ class KinematicStateFilter:
                     ])
                     R_step = np.eye(3) + np.sin(step_theta) * K + (1.0 - np.cos(step_theta)) * (K @ K)
                     self.rot = self.rot @ R_step
+
+            # Smoothly update velocity state
+            step_pos = self.pos - old_pos
+            self.vel_pos = 0.7 * self.vel_pos + 0.3 * step_pos
+            step_rot = old_rot.T @ self.rot
+            self.vel_rot = step_rot
         else:
+            # Kinematic constant-velocity forward extrapolation
             is_spike = True
+            self.pos = self.pos + self.vel_pos
+            self.rot = self.rot @ self.vel_rot
 
         T_out = np.eye(4, dtype=np.float64)
         T_out[:3, :3] = self.rot
@@ -173,8 +187,8 @@ class BundleNeMOOptimizer:
     """
     Sliding-Window SE(3) Bundle Adjustment Optimizer.
     Combines:
-    1. Kinematic Lie-group smoothing.
-    2. Robust Huber 2D-3D canonical reprojection optimization.
+    1. Kinematic Lie-group smoothing with constant-velocity extrapolation.
+    2. Inlier-filtered robust Huber 2D-3D canonical reprojection optimization.
     3. Regularized step clamping on se(3) tangent space.
     """
     def __init__(
@@ -197,7 +211,8 @@ class BundleNeMOOptimizer:
         pts2d_pixels: np.ndarray,
         conf_weights: np.ndarray,
         T_cam_obj_pnp: Optional[np.ndarray],
-        pnp_valid: bool
+        pnp_valid: bool,
+        inliers: Optional[np.ndarray] = None
     ) -> Dict[str, Any]:
         """
         Refine pose using Huber reprojection error over 2D-3D inliers.
@@ -206,14 +221,24 @@ class BundleNeMOOptimizer:
         T_init = filt_res['T_cam_obj']
         is_spike = filt_res['is_spike']
 
-        if len(pts3d_canon) >= 20 and not is_spike:
-            # Subsample points for fast optimization
-            num_pts = min(250, len(pts3d_canon))
-            step_sub = max(1, len(pts3d_canon) // num_pts)
+        # Filter strictly by PnP inliers if available
+        if inliers is not None and len(inliers) >= 15:
+            pts3d_opt = pts3d_canon[inliers]
+            pts2d_opt = pts2d_pixels[inliers]
+            conf_opt = conf_weights[inliers]
+        else:
+            pts3d_opt = pts3d_canon
+            pts2d_opt = pts2d_pixels
+            conf_opt = conf_weights
 
-            pts3d_t = torch.as_tensor(pts3d_canon[::step_sub], dtype=torch.float32, device=self.device)
-            pts2d_t = torch.as_tensor(pts2d_pixels[::step_sub], dtype=torch.float32, device=self.device)
-            w_t = torch.as_tensor(conf_weights[::step_sub], dtype=torch.float32, device=self.device)
+        if len(pts3d_opt) >= 20 and not is_spike:
+            # Subsample points for fast optimization
+            num_pts = min(250, len(pts3d_opt))
+            step_sub = max(1, len(pts3d_opt) // num_pts)
+
+            pts3d_t = torch.as_tensor(pts3d_opt[::step_sub], dtype=torch.float32, device=self.device)
+            pts2d_t = torch.as_tensor(pts2d_opt[::step_sub], dtype=torch.float32, device=self.device)
+            w_t = torch.as_tensor(conf_opt[::step_sub], dtype=torch.float32, device=self.device)
             K_t = torch.as_tensor(K, dtype=torch.float32, device=self.device)
             T_init_t = torch.as_tensor(T_init, dtype=torch.float32, device=self.device)
 

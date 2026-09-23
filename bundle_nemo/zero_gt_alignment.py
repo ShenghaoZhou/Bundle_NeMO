@@ -174,27 +174,18 @@ class ZeroGTAlignmentEngine:
             mutual_v, mutual_u = np.where(mutual_mask)
 
         if len(mutual_v) < 15:
-            return False, np.eye(3), f"Insufficient mutual inliers ({len(mutual_v)} < 15)"
+            return False, np.eye(3), 0, f"Insufficient mutual inliers ({len(mutual_v)} < 15)"
 
-        # Points in new cluster frame (centered)
+        # Points in new cluster local frame (centered)
         c_k = new_cluster_surf.mean(axis=0)
         pts_k_centered = pts_k[mutual_v, mutual_u] - c_k
 
-        # Points in reference canonical frame
-        pts_ref_canon = memory_bank.get_canonical_3d_points(
-            cluster_idx=reference_cluster_idx,
-            pts3d_local=pts_ref,
-            scale=1.0  # Keep in unscaled canonical NeMO space
-        )[mutual_v, mutual_u]
+        # Points in reference cluster local frame (centered)
+        ref_cluster = memory_bank.clusters[reference_cluster_idx]
+        c_ref = ref_cluster['center']
+        pts_ref_centered = pts_ref[mutual_v, mutual_u] - c_ref
 
-        # In reference canonical space, subtract c0 so we solve pure rotation around center
-        c0 = memory_bank.c0
-        if memory_bank.R_canon_align is not None:
-            # Invert R_canon_align to work in NeMO canonical space
-            pts_ref_canon = pts_ref_canon @ memory_bank.R_canon_align
-        pts_ref_centered = pts_ref_canon - c0
-
-        # Solve RANSAC Umeyama: pts_ref_centered = R_k_to_0 @ pts_k_centered
+        # Solve RANSAC Umeyama: pts_ref_centered = R_k_to_ref @ pts_k_centered
         success, R_k_to_ref, _, inliers = ransac_umeyama(
             src=pts_k_centered,
             dst=pts_ref_centered,
@@ -203,9 +194,9 @@ class ZeroGTAlignmentEngine:
         )
 
         if not success:
-            return False, np.eye(3), f"RANSAC Umeyama rejected (inliers: {inliers})"
+            return False, np.eye(3), 0, f"RANSAC Umeyama rejected (inliers: {inliers})"
 
-        return True, R_k_to_ref, f"Umeyama solved with {inliers} mutual inliers ({inliers}/{len(mutual_v)})"
+        return True, R_k_to_ref, inliers, f"Umeyama solved with {inliers} mutual inliers ({inliers}/{len(mutual_v)})"
 
     def estimate_and_refine_cluster_rotation(
         self,
@@ -219,47 +210,51 @@ class ZeroGTAlignmentEngine:
     ) -> Tuple[np.ndarray, str]:
         """
         Complete Method A + B pipeline:
-        1. Find 3D tie points against preceding cluster and cluster 0 (Method A).
-        2. Refine resulting canonical surface points against fused voxel cloud via ICP (Method B).
-        3. Fall back to tracker pose if overlap is too small.
+        1. Find 3D tie points against candidate clusters (preceding clusters & cluster 0) (Method A).
+        2. Select the candidate transformation with the highest mutual inlier consensus.
+        3. Refine resulting canonical surface points against fused voxel cloud via ICP (Method B).
+        4. Fall back to tracker pose if overlap is too small.
         """
         best_R = None
+        best_inliers = 0
         best_source = "fallback"
 
-        # Try aligning with previous cluster (closest in viewing angle, highest overlap)
+        # Tracker coarse pose prior
+        R_coarse = memory_bank.R_ref0 @ fallback_R.T
+
+        # Test candidate clusters: immediate previous cluster, and cluster 0
+        cand_indices = []
         if len(memory_bank.clusters) > 1:
-            prev_idx = len(memory_bank.clusters) - 1
-            succ_prev, R_k_to_prev, info_prev = self.find_cross_cluster_transform(
+            cand_indices.append(len(memory_bank.clusters) - 1)
+        if 0 not in cand_indices:
+            cand_indices.append(0)
+
+        for ref_idx in cand_indices:
+            succ, R_k_to_ref, inl_count, info = self.find_cross_cluster_transform(
                 keyframe_crop=keyframe_crop,
                 memory_bank=memory_bank,
                 new_features_3d=new_features_3d,
                 new_cluster_surf=new_cluster_surf,
-                reference_cluster_idx=prev_idx,
+                reference_cluster_idx=ref_idx,
                 scale=scale
             )
-            if succ_prev:
-                # Chain: R_{k -> 0} = R_{(k-1) -> 0} @ R_{k -> (k-1)}
-                R_prev_to_0 = memory_bank.clusters[prev_idx]['R_k_to_0']
-                best_R = R_prev_to_0 @ R_k_to_prev
-                best_source = f"Chained Umeyama from Cluster {prev_idx} ({info_prev})"
+            if succ and inl_count > best_inliers:
+                R_ref_to_0 = memory_bank.clusters[ref_idx]['R_k_to_0']
+                R_cand = R_ref_to_0 @ R_k_to_ref
 
-        # Also test direct alignment to Cluster 0
-        succ_0, R_k_to_0, info_0 = self.find_cross_cluster_transform(
-            keyframe_crop=keyframe_crop,
-            memory_bank=memory_bank,
-            new_features_3d=new_features_3d,
-            new_cluster_surf=new_cluster_surf,
-            reference_cluster_idx=0,
-            scale=scale
-        )
-        if succ_0:
-            if best_R is None:
-                best_R = R_k_to_0
-                best_source = f"Direct Umeyama from Cluster 0 ({info_0})"
+                # Consistency check with tracker motion prior: reject flip solutions (> 75 deg divergence)
+                R_diff = R_cand @ R_coarse.T
+                tr = np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0)
+                div_deg = float(np.rad2deg(np.arccos(tr)))
 
-        # Fallback if cross-cluster decodes had insufficient mutual inliers
+                if div_deg < 75.0 or best_R is None:
+                    best_R = R_cand
+                    best_inliers = inl_count
+                    best_source = f"Umeyama from Cluster {ref_idx} ({info})"
+
+        # Fallback if cross-cluster decodes had insufficient mutual inliers or were rejected
         if best_R is None:
-            best_R = memory_bank.R_ref0 @ fallback_R.T
+            best_R = R_coarse
             best_source = "Tracker Coarse Pose Fallback"
 
         # Method B: Fine-tune using Surface ICP against accumulated Canonical Fusion
