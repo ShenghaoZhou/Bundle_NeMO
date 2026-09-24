@@ -31,12 +31,14 @@ class AlignedDynamicNeMOMemoryBank:
         model,
         device: torch.device,
         min_keyframe_rot_deg: float = 28.0,
-        min_inlier_ratio_trigger: float = 0.20
+        min_inlier_ratio_trigger: float = 0.20,
+        min_keyframe_trans_m: float = 0.08
     ):
         self.model = model
         self.device = device
         self.min_keyframe_rot_deg = min_keyframe_rot_deg
         self.min_inlier_ratio_trigger = min_inlier_ratio_trigger
+        self.min_keyframe_trans_m = min_keyframe_trans_m
 
         self.clusters: List[Dict[str, Any]] = []
         self.features_stacked: Optional[torch.Tensor] = None
@@ -61,9 +63,9 @@ class AlignedDynamicNeMOMemoryBank:
         """
         Evaluate if a new keyframe memory cluster should be admitted into the bank.
         Triggers strictly when:
-        1. Viewing angle difference >= min_keyframe_rot_deg from all existing clusters.
+        1. Viewing angle difference >= min_keyframe_rot_deg or translation >= min_keyframe_trans_m.
         2. Cooldown of at least 20 frames has elapsed.
-        3. Current inliers are healthy (>= 35% ratio, not in severe occlusion).
+        3. Current inliers are healthy (>= min_inlier_ratio_trigger, not in severe occlusion).
         """
         if len(self.clusters) == 0:
             return True, "Initial cluster"
@@ -74,19 +76,34 @@ class AlignedDynamicNeMOMemoryBank:
             return False, f"Cooldown active ({frame_idx - last_frame} < 20 frames)"
 
         # Prevent adding keyframes during heavy hand occlusion
-        if current_inlier_ratio < 0.35:
-            return False, f"Inlier ratio too low ({current_inlier_ratio:.1%} < 35%)"
+        if current_inlier_ratio < self.min_inlier_ratio_trigger:
+            return False, f"Inlier ratio too low ({current_inlier_ratio:.1%} < {self.min_inlier_ratio_trigger:.1%})"
 
-        # Check geodesic rotation against all existing clusters
+        # Handle full 4x4 pose or 3x3 rotation
+        if current_R_cam_obj.shape == (4, 4):
+            current_R = current_R_cam_obj[:3, :3]
+            current_t = current_R_cam_obj[:3, 3]
+        else:
+            current_R = current_R_cam_obj
+            current_t = None
+
+        # Check geodesic rotation and translation against all existing clusters
         min_angle = float('inf')
+        min_dist = float('inf')
         for cluster in self.clusters:
             R_kf = cluster['R_cam_obj']
-            ang = geodesic_angle_deg(current_R_cam_obj, R_kf)
+            ang = geodesic_angle_deg(current_R, R_kf)
             if ang < min_angle:
                 min_angle = ang
+            if current_t is not None and cluster.get('t_cam_obj') is not None:
+                dist = float(np.linalg.norm(current_t - cluster['t_cam_obj']))
+                if dist < min_dist:
+                    min_dist = dist
 
         if min_angle >= self.min_keyframe_rot_deg:
             return True, f"Rotation delta {min_angle:.1f}° >= {self.min_keyframe_rot_deg}°"
+        if current_t is not None and min_dist >= self.min_keyframe_trans_m:
+            return True, f"Translation delta {min_dist*100:.1f}cm >= {self.min_keyframe_trans_m*100:.1f}cm"
 
         return False, "Sufficient overlap"
 
@@ -114,14 +131,21 @@ class AlignedDynamicNeMOMemoryBank:
             n['features_3d_updated'] = n['features_3d'] + self.model.point_encoder(n['surface_points'])
             surf = n['surface_points'][0].cpu().numpy()
 
+        if R_cam_obj_kf.shape == (4, 4):
+            R_rot = R_cam_obj_kf[:3, :3]
+            t_trans = R_cam_obj_kf[:3, 3].copy()
+        else:
+            R_rot = R_cam_obj_kf
+            t_trans = None
+
         if self.R_ref0 is None:
-            self.R_ref0 = R_cam_obj_kf.copy()
+            self.R_ref0 = R_rot.copy()
 
         # Relative rotation mapping points from cluster k's camera-centric frame to canonical Reference (Cluster 0)
         if R_k_to_0_override is not None:
             R_k_to_0 = R_k_to_0_override.copy()
         else:
-            R_k_to_0 = self.R_ref0 @ R_cam_obj_kf.T
+            R_k_to_0 = self.R_ref0 @ R_rot.T
         c_k = surf.mean(axis=0)
 
         if len(self.clusters) == 0:
@@ -130,7 +154,8 @@ class AlignedDynamicNeMOMemoryBank:
         cluster_entry = {
             'name': name,
             'frame_idx': frame_idx,
-            'R_cam_obj': R_cam_obj_kf.copy(),
+            'R_cam_obj': R_rot.copy(),
+            't_cam_obj': t_trans,
             'features_3d_updated': n['features_3d_updated'],
             'surface_points': surf,
             'R_k_to_0': R_k_to_0,
@@ -145,12 +170,13 @@ class AlignedDynamicNeMOMemoryBank:
 
     def decode_query(
         self,
-        query_img_crop: Image.Image
+        query_img_crop: Image.Image,
+        query_mask_crop: Optional[np.ndarray] = None
     ) -> Tuple[Dict[str, torch.Tensor], int]:
         """
         Decode query image crop across all active memory clusters simultaneously.
         Uses cached single-pass DINOv2 feature extraction to avoid redundant backbone passes.
-        Selects the best cluster with highest inlier confidence.
+        Selects the best cluster with highest inlier confidence, evaluated on foreground pixels.
         """
         K = len(self.clusters)
 
@@ -175,10 +201,23 @@ class AlignedDynamicNeMOMemoryBank:
             with torch.no_grad():
                 dec_out = self.model.decode_images(t_input, self.features_stacked)
 
-        conf_maxs = dec_out['conf'].amax(dim=[-1, -2]).cpu().numpy().ravel()
-        conf_means = dec_out['conf'].mean(dim=[-1, -2]).cpu().numpy().ravel()
-        score = conf_maxs + 2.0 * conf_means
-        best_cluster_idx = int(np.argmax(score))
+        if query_mask_crop is not None:
+            mask_t = torch.as_tensor(query_mask_crop > 0, device=self.device)
+            scores = []
+            for k in range(K):
+                conf_k = dec_out['conf'][k, 0]
+                conf_fg = conf_k[mask_t]
+                if conf_fg.numel() > 20:
+                    score = float(conf_fg.max().item() + 2.0 * conf_fg.mean().item())
+                else:
+                    score = float(conf_k.max().item() + 2.0 * conf_k.mean().item())
+                scores.append(score)
+            best_cluster_idx = int(np.argmax(scores))
+        else:
+            conf_maxs = dec_out['conf'].amax(dim=[-1, -2]).cpu().numpy().ravel()
+            conf_means = dec_out['conf'].mean(dim=[-1, -2]).cpu().numpy().ravel()
+            score = conf_maxs + 2.0 * conf_means
+            best_cluster_idx = int(np.argmax(score))
 
         return dec_out, best_cluster_idx
 

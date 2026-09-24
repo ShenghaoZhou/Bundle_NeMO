@@ -2,7 +2,7 @@
 
 **BundleNeMO** combines the multi-view keyframe management and pose graph tracking architecture of **BundleSDF** with the feed-forward lifting, dense canonical coordinate mapping, and Neural Memory Object representation of **NeMO**.
 
-By replacing both pairwise feature matching (**LoFTR**) and implicit neural radiance fields (**Instant-NGP / SDF volume rendering**) with instant NeMO feed-forward feature lifting, BundleNeMO achieves **near real-time to real-time (>27 FPS)** 6-DoF object tracking and metric watertight 3D reconstruction without per-object CAD models or offline pre-training.
+By replacing both pairwise feature matching (**LoFTR**) and implicit neural radiance fields (**Instant-NGP / SDF volume rendering**) with instant NeMO feed-forward feature lifting, BundleNeMO achieves **near real-time to real-time (>27 FPS)** 6-DoF object tracking and clean 3D reconstruction without per-object CAD models or offline pre-training.
 
 ---
 
@@ -14,7 +14,7 @@ By replacing both pairwise feature matching (**LoFTR**) and implicit neural radi
   - **Method C (`--alignment_mode pose_graph`)**: BundleSDF-style joint keyframe factor graph optimization on $\mathfrak{se}(3)$ Lie algebra tangent space.
   - **Oracle Reference (`--alignment_mode gt`)**: Oracle keyframe rotation baseline for diagnostic validation.
 - **Real-Time Kinematic Prior**: Supports skip-frame decoding (`--decode_stride 2`) with causal Lie-group kinematic state filtering, achieving **>27 effective FPS**.
-- **Unified Canonical Voxel Grid**: Vectorized running-average voxel fusion producing clean, watertight Poisson surface meshes.
+- **Unified Canonical Voxel Grid**: Vectorized running-average voxel fusion producing clean, density-trimmed Poisson surface meshes.
 
 ---
 
@@ -53,14 +53,23 @@ BundleSDF/
 │   ├── pose_graph.py        # Method C (BundleSDF-style keyframe BA on se(3))
 │   └── tracker.py           # BundleNeMOTracker (main orchestrator)
 ├── run_bundle_nemo.py       # CLI tracking runner with Rerun streaming
-└── tests/                   # Full unit test suite (12 tests)
+└── tests/                   # Full unit test suite (20 tests)
 ```
 
 ---
 
 ## Setup & Quick Start
 
-### 1. Initialize Git Submodules & Checkpoint
+### 1. Environment Setup with Pixi
+```bash
+# Install all pure-Python BundleNeMO dependencies with CUDA acceleration
+pixi install
+
+# Run the 20 unit tests to verify installation
+pixi run test
+```
+
+### 2. Initialize Git Submodules & Checkpoint
 ```bash
 # Initialize NeMO submodule
 git submodule update --init --recursive
@@ -79,7 +88,7 @@ python run_bundle_nemo.py \
     --save_rrd outputs/run_cross_icp/recording.rrd
 ```
 
-### 2. Run Keyframe Pose Graph Optimization (Method C, Zero-GT)
+### 3. Run Keyframe Pose Graph Optimization (Method C, Zero-GT)
 ```bash
 python run_bundle_nemo.py \
     --data_dir /path/to/sequence \
@@ -89,7 +98,7 @@ python run_bundle_nemo.py \
     --save_rrd outputs/run_pose_graph/recording.rrd
 ```
 
-### 3. Run Real-Time Mode (>27 FPS)
+### 4. Run Real-Time Mode (>27 FPS)
 ```bash
 python run_bundle_nemo.py \
     --data_dir /path/to/sequence \
@@ -99,7 +108,7 @@ python run_bundle_nemo.py \
     --save_rrd outputs/run_realtime/recording.rrd
 ```
 
-### 4. Run Unit Tests
+### 5. Run Unit Tests
 ```bash
 python -m unittest discover -s tests -p "test_*.py"
 ```

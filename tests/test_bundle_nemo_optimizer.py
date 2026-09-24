@@ -77,6 +77,56 @@ class TestBundleNeMOOptimizer(unittest.TestCase):
 
         self.assertLess(pos_err_opt, pos_err_init)
 
+    def test_project_points_behind_camera(self):
+        K = torch.tensor([[500.0, 0.0, 320.0], [0.0, 500.0, 240.0], [0.0, 0.0, 1.0]])
+        # 1 point in front (z=1.0), 1 point behind camera (z=-0.5)
+        pts_cam = torch.tensor([[0.1, 0.1, 1.0], [0.1, 0.1, -0.5]])
+        proj, in_front = project_points(K, pts_cam, eps=0.05, return_valid_mask=True)
+        self.assertTrue(in_front[0])
+        self.assertFalse(in_front[1])
+
+    def test_optimizer_with_inliers(self):
+        optimizer = BundleNeMOOptimizer(num_refine_iters=15, lr=0.02)
+        K = np.array([[500.0, 0.0, 320.0], [0.0, 500.0, 240.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+
+        T_gt = np.eye(4)
+        T_gt[:3, 3] = [0.0, 0.0, 0.70]
+
+        np.random.seed(42)
+        pts3d_canon = np.random.uniform(-0.1, 0.1, (60, 3)).astype(np.float32)
+        pts3d_cam = (T_gt[:3, :3] @ pts3d_canon.T).T + T_gt[:3, 3]
+        pts2d = (K @ pts3d_cam.T).T
+        pts2d = pts2d[:, :2] / pts2d[:, 2:3]
+
+        # Add corrupt outliers to last 20 points
+        pts2d[-20:] += np.random.uniform(50, 100, (20, 2))
+        conf = np.ones(60, dtype=np.float32)
+
+        # Inliers only cover first 40 clean points
+        inliers = np.arange(40)
+        T_init = T_gt.copy()
+        T_init[:3, 3] += [0.015, -0.01, 0.02]
+
+        optimizer.filter.step(T_gt, True)
+        res = optimizer.optimize_step(K, pts3d_canon, pts2d, conf, T_init, True, inliers=inliers)
+        T_opt = res['T_cam_obj']
+
+        pos_err_init = np.linalg.norm(T_init[:3, 3] - T_gt[:3, 3])
+        pos_err_opt = np.linalg.norm(T_opt[:3, 3] - T_gt[:3, 3])
+        self.assertLess(pos_err_opt, pos_err_init)
+
+    def test_filter_resync(self):
+        filt = KinematicStateFilter(max_jump_m=0.045)
+        T0 = np.eye(4)
+        T0[:3, 3] = [0.0, 0.0, 1.0]
+        filt.step(T0, True)
+
+        # Resync to new pose
+        T_new = np.eye(4)
+        T_new[:3, 3] = [0.2, -0.1, 1.5]
+        filt.resync(T_new)
+        self.assertTrue(np.allclose(filt.pos, [0.2, -0.1, 1.5]))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,6 +1,5 @@
 import numpy as np
 import torch
-import open3d as o3d
 from PIL import Image
 from typing import Tuple, Optional, Dict, Any, List
 from einops import rearrange
@@ -127,7 +126,7 @@ class ZeroGTAlignmentEngine:
         new_cluster_surf: np.ndarray,
         reference_cluster_idx: int,
         scale: float = 1.0
-    ) -> Tuple[bool, np.ndarray, str]:
+    ) -> Tuple[bool, np.ndarray, int, str]:
         """
         Estimate R_{k -> ref} mapping the new cluster's centered coordinates
         to the reference cluster's canonical coordinates without ground truth.
@@ -135,6 +134,7 @@ class ZeroGTAlignmentEngine:
         Returns:
             success: bool
             R_k_to_ref: (3, 3) rotation matrix
+            inl_count: int count of RANSAC inliers
             info: str explanation
         """
         # 1. Decode keyframe crop against reference cluster
@@ -247,7 +247,7 @@ class ZeroGTAlignmentEngine:
                 tr = np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0)
                 div_deg = float(np.rad2deg(np.arccos(tr)))
 
-                if div_deg < 75.0 or best_R is None:
+                if div_deg < 75.0:
                     best_R = R_cand
                     best_inliers = inl_count
                     best_source = f"Umeyama from Cluster {ref_idx} ({info})"

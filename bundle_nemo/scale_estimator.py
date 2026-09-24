@@ -14,6 +14,8 @@ class AutomaticScaleEstimator:
       s = median(||P_cam - center_cam||) / median(||X_canon - center_canon||)
     """
 
+    DEFAULT_SCALE: float = 0.35577
+
     @staticmethod
     def estimate_scale_from_depth(
         pts3d_canon: np.ndarray,
@@ -57,7 +59,7 @@ class AutomaticScaleEstimator:
 
         if np.sum(valid_mask) < 20:
             # Fallback to default scale if depth is insufficient
-            return 0.35
+            return AutomaticScaleEstimator.DEFAULT_SCALE
 
         d_valid = d[valid_mask]
         u_valid = pts2d_pixels[valid_mask, 0]
@@ -79,7 +81,7 @@ class AutomaticScaleEstimator:
 
         valid_rad = (rad_canon > 1e-4) & (rad_cam > 1e-4)
         if np.sum(valid_rad) < 10:
-            return 0.35
+            return AutomaticScaleEstimator.DEFAULT_SCALE
 
         # Ratio of 75th percentiles / median spread (robust to boundary outliers)
         scale_median = float(np.median(rad_cam[valid_rad] / rad_canon[valid_rad]))

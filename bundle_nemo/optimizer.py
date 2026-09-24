@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Union
 
 
 def exp_so3(omega: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
@@ -69,8 +69,17 @@ def transform_points(T: torch.Tensor, pts: torch.Tensor) -> torch.Tensor:
     return torch.matmul(pts, R.t()) + t
 
 
-def project_points(K: torch.Tensor, pts_cam: torch.Tensor, eps: float = 0.05) -> torch.Tensor:
-    """Project 3D camera points to 2D pixel coordinates."""
+def project_points(
+    K: torch.Tensor,
+    pts_cam: torch.Tensor,
+    eps: float = 0.05,
+    return_valid_mask: bool = False
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Project 3D camera points to 2D pixel coordinates.
+    Masks points behind or too close to the camera (z <= eps).
+    """
+    in_front = pts_cam[..., 2] > eps
     z = torch.clamp(pts_cam[..., 2:3], min=eps)
     xy = pts_cam[..., :2] / z
     fx = K[0, 0]
@@ -79,7 +88,10 @@ def project_points(K: torch.Tensor, pts_cam: torch.Tensor, eps: float = 0.05) ->
     cy = K[1, 2]
     u = fx * xy[..., 0] + cx
     v = fy * xy[..., 1] + cy
-    return torch.stack([u, v], dim=-1)
+    proj = torch.stack([u, v], dim=-1)
+    if return_valid_mask:
+        return proj, in_front
+    return proj
 
 
 class KinematicStateFilter:
@@ -174,6 +186,7 @@ class KinematicStateFilter:
         else:
             # Kinematic constant-velocity forward extrapolation
             is_spike = True
+            self.spike_count += 1
             self.pos = self.pos + self.vel_pos
             self.rot = self.rot @ self.vel_rot
 
@@ -183,26 +196,45 @@ class KinematicStateFilter:
         return {'T_cam_obj': T_out, 'is_spike': is_spike, 'total_spikes': self.spike_count}
 
 
+    def resync(self, T_cam_obj: np.ndarray) -> None:
+        """Resync filter state to a verified or optimized pose, clearing step bias."""
+        self.pos = T_cam_obj[:3, 3].astype(np.float64).copy()
+        self.rot = T_cam_obj[:3, :3].astype(np.float64).copy()
+
+
 class BundleNeMOOptimizer:
     """
     Sliding-Window SE(3) Bundle Adjustment Optimizer.
     Combines:
     1. Kinematic Lie-group smoothing with constant-velocity extrapolation.
     2. Inlier-filtered robust Huber 2D-3D canonical reprojection optimization.
-    3. Regularized step clamping on se(3) tangent space.
+    3. Regularized step damping on se(3) tangent space with decoupled translation/rotation priors.
     """
     def __init__(
         self,
         huber_delta: float = 2.0,
         num_refine_iters: int = 12,
         lr: float = 0.010,
+        weight_trans: float = 40.0,
+        weight_rot: float = 40.0,
+        max_jump_m: float = 0.055,
+        max_step_rot_deg: float = 35.0,
+        alpha_pos: float = 0.75,
+        alpha_rot: float = 0.75,
         device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     ):
         self.huber_delta = huber_delta
         self.num_refine_iters = num_refine_iters
         self.lr = lr
+        self.weight_trans = weight_trans
+        self.weight_rot = weight_rot
         self.device = device
-        self.filter = KinematicStateFilter()
+        self.filter = KinematicStateFilter(
+            max_jump_m=max_jump_m,
+            max_step_rot_deg=max_step_rot_deg,
+            alpha_pos=alpha_pos,
+            alpha_rot=alpha_rot
+        )
 
     def optimize_step(
         self,
@@ -216,10 +248,18 @@ class BundleNeMOOptimizer:
     ) -> Dict[str, Any]:
         """
         Refine pose using Huber reprojection error over 2D-3D inliers.
+        When kinematic clamp/spike fires but PnP is valid, BA is initialized from
+        PnP measurements to refine pose and prevent permanent filter lag.
         """
         filt_res = self.filter.step(T_cam_obj_pnp, pnp_valid)
-        T_init = filt_res['T_cam_obj']
+        T_filt = filt_res['T_cam_obj']
         is_spike = filt_res['is_spike']
+
+        # If a kinematic clamp occurred but PnP was valid, use PnP measurement as init for BA
+        if is_spike and pnp_valid and T_cam_obj_pnp is not None:
+            T_init = T_cam_obj_pnp
+        else:
+            T_init = T_filt
 
         # Filter strictly by PnP inliers if available
         if inliers is not None and len(inliers) >= 15:
@@ -231,7 +271,7 @@ class BundleNeMOOptimizer:
             pts2d_opt = pts2d_pixels
             conf_opt = conf_weights
 
-        if len(pts3d_opt) >= 20 and not is_spike:
+        if len(pts3d_opt) >= 20 and pnp_valid:
             # Subsample points for fast optimization
             num_pts = min(250, len(pts3d_opt))
             step_sub = max(1, len(pts3d_opt) // num_pts)
@@ -252,7 +292,7 @@ class BundleNeMOOptimizer:
                 optimizer.zero_grad()
                 T_cand = torch.matmul(exp_se3(delta_xi), T_init_t)
                 pts_c = transform_points(T_cand, pts3d_t)
-                proj = project_points(K_t, pts_c, eps=0.05)
+                proj, in_front = project_points(K_t, pts_c, eps=0.05, return_valid_mask=True)
 
                 diff = proj - pts2d_t
                 dist = torch.sqrt(torch.sum(diff ** 2, dim=-1) + 1e-6)
@@ -261,7 +301,10 @@ class BundleNeMOOptimizer:
                     0.5 * dist ** 2,
                     self.huber_delta * (dist - 0.5 * self.huber_delta)
                 )
-                loss = torch.mean(w_t * huber) + 40.0 * torch.sum(delta_xi ** 2)
+                valid_w = w_t * in_front.float()
+                w_sum = torch.sum(valid_w) + 1e-6
+                reg_loss = self.weight_trans * torch.sum(delta_xi[:3] ** 2) + self.weight_rot * torch.sum(delta_xi[3:] ** 2)
+                loss = torch.sum(valid_w * huber) / w_sum + reg_loss
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     break
@@ -275,10 +318,13 @@ class BundleNeMOOptimizer:
 
             if torch.isfinite(best_T).all():
                 T_opt = best_T.cpu().numpy()
+                # If BA was initialized from PnP during spike or converged well, resync filter to clear lag
+                if is_spike:
+                    self.filter.resync(T_opt)
             else:
                 T_opt = T_init
         else:
-            T_opt = T_init
+            T_opt = T_filt
 
         return {
             'T_cam_obj': T_opt,

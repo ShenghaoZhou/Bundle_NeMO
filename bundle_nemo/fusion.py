@@ -56,11 +56,21 @@ class CanonicalObjectFusion:
                 criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=30)
             )
             trans = np.array(result.transformation, dtype=np.float64)
-            # Accept if refinement is a reasonable small adjustment (< 3 cm translation)
-            if np.linalg.norm(trans[:3, 3]) < 0.03:
-                return trans
-            else:
-                return np.eye(4, dtype=np.float64)
+            # Accept if refinement is a reasonable small adjustment (< 3 cm translation, < 25 deg rotation)
+            R_delta = trans[:3, :3]
+            tr = np.clip((np.trace(R_delta) - 1.0) / 2.0, -1.0, 1.0)
+            ang_deg = float(np.rad2deg(np.arccos(tr)))
+            t_norm = float(np.linalg.norm(trans[:3, 3]))
+
+            if ang_deg < 25.0:
+                if t_norm < 0.03:
+                    return trans
+                elif t_norm < 0.06:
+                    # Preserve rotation adjustment even if translation slightly drifted
+                    trans_rot_only = np.eye(4, dtype=np.float64)
+                    trans_rot_only[:3, :3] = R_delta
+                    return trans_rot_only
+            return np.eye(4, dtype=np.float64)
         except Exception:
             return np.eye(4, dtype=np.float64)
 

@@ -4,7 +4,7 @@ import numpy as np
 import cv2
 import torch
 from PIL import Image
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, Union
 
 from .scale_estimator import AutomaticScaleEstimator
 from .memory_bank import AlignedDynamicNeMOMemoryBank
@@ -21,8 +21,9 @@ def crop_masked_object(
     binary_mask: np.ndarray,
     foreground_mask: Optional[np.ndarray] = None,
     padding_ratio: float = 0.15,
-    crop_size: int = 224
-) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
+    crop_size: int = 224,
+    return_mask: bool = False
+) -> Union[Tuple[Image.Image, Tuple[int, int, int, int]], Tuple[Image.Image, Tuple[int, int, int, int], np.ndarray]]:
     """
     Extract tightly bounded foreground crop on white canvas for NeMO input.
     Uses binary_mask (amodal) for bounding box and foreground_mask (modal) for canvas isolation.
@@ -30,13 +31,17 @@ def crop_masked_object(
     Returns:
         crop_pil: (crop_size, crop_size) RGB PIL image.
         crop_box: (x1, y1, x2, y2) in original image coordinates.
+        crop_fg_mask (if return_mask=True): (crop_size, crop_size) uint8 foreground mask (0 or 255).
     """
     H, W = binary_mask.shape[:2]
     ys, xs = np.where(binary_mask > 0)
 
     if len(ys) == 0 or len(xs) == 0:
         pil_img = Image.fromarray(rgb_img)
-        return pil_img.resize((crop_size, crop_size)), (0, 0, W, H)
+        crop_pil = pil_img.resize((crop_size, crop_size))
+        if return_mask:
+            return crop_pil, (0, 0, W, H), np.zeros((crop_size, crop_size), dtype=np.uint8)
+        return crop_pil, (0, 0, W, H)
 
     y1, y2 = int(ys.min()), int(ys.max())
     x1, x2 = int(xs.min()), int(xs.max())
@@ -67,6 +72,9 @@ def crop_masked_object(
     canvas = np.where(fg_mask, crop_rgb, canvas)
 
     crop_pil = Image.fromarray(canvas).resize((crop_size, crop_size), Image.Resampling.LANCZOS)
+    if return_mask:
+        crop_fg_mask = cv2.resize(fg_mask[..., 0].astype(np.uint8) * 255, (crop_size, crop_size), interpolation=cv2.INTER_NEAREST)
+        return crop_pil, (nx1, ny1, nx2, ny2), crop_fg_mask
     return crop_pil, (nx1, ny1, nx2, ny2)
 
 
@@ -83,10 +91,25 @@ class BundleNeMOTracker:
         device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
         metric_scale: Optional[float] = None,
         min_keyframe_rot_deg: float = 28.0,
+        min_inlier_ratio_trigger: float = 0.20,
+        min_keyframe_trans_m: float = 0.08,
         voxel_size: float = 0.003,
         decode_stride: int = 1,
         use_icp_refinement: bool = True,
-        alignment_mode: str = "cross_icp"  # "cross_icp" (A+B), "pose_graph" (C), or "gt"
+        alignment_mode: str = "cross_icp",  # "cross_icp" (A+B), "pose_graph" (C), or "gt"
+        conf_threshold: float = 1.0,
+        reprojection_error_pnp: float = 8.0,
+        confidence_pnp: float = 0.9999,
+        iterations_pnp: int = 400,
+        huber_delta: float = 2.0,
+        num_refine_iters: int = 12,
+        lr: float = 0.010,
+        weight_trans: float = 40.0,
+        weight_rot: float = 40.0,
+        max_jump_m: float = 0.055,
+        max_step_rot_deg: float = 35.0,
+        ransac_dist_thresh: float = 0.015,
+        max_icp_dist: float = 0.025
     ):
         self.device = device
         self.model = nemo_model
@@ -100,18 +123,39 @@ class BundleNeMOTracker:
         self.memory_bank = AlignedDynamicNeMOMemoryBank(
             model=self.model,
             device=self.device,
-            min_keyframe_rot_deg=min_keyframe_rot_deg
+            min_keyframe_rot_deg=min_keyframe_rot_deg,
+            min_inlier_ratio_trigger=min_inlier_ratio_trigger,
+            min_keyframe_trans_m=min_keyframe_trans_m
         )
-        self.corres_engine = NeMOCorrespondenceEngine()
-        self.optimizer = BundleNeMOOptimizer(device=self.device)
+        self.corres_engine = NeMOCorrespondenceEngine(
+            conf_threshold=conf_threshold,
+            reprojection_error=reprojection_error_pnp,
+            confidence_pnp=confidence_pnp,
+            iterations_pnp=iterations_pnp
+        )
+        self.optimizer = BundleNeMOOptimizer(
+            huber_delta=huber_delta,
+            num_refine_iters=num_refine_iters,
+            lr=lr,
+            weight_trans=weight_trans,
+            weight_rot=weight_rot,
+            max_jump_m=max_jump_m,
+            max_step_rot_deg=max_step_rot_deg,
+            device=self.device
+        )
         self.fusion = CanonicalObjectFusion(voxel_size=voxel_size)
 
         # Zero-GT Alignment Engines (Methods A, B, and C)
-        self.zero_gt_aligner = ZeroGTAlignmentEngine(model=self.model, device=self.device)
+        self.zero_gt_aligner = ZeroGTAlignmentEngine(
+            model=self.model,
+            device=self.device,
+            conf_threshold=conf_threshold,
+            ransac_dist_thresh=ransac_dist_thresh,
+            max_icp_dist=max_icp_dist
+        )
         self.pose_graph = KeyframePoseGraph(device=self.device)
 
         self.frame_count = 0
-        self.keyframe_crops_buffer: List[Image.Image] = []
         self.last_T_cam_obj: Optional[np.ndarray] = None
 
     def process_first_frame(
@@ -126,8 +170,9 @@ class BundleNeMOTracker:
         """
         Initialize the tracker with the initial frame observation.
         """
-        crop_pil, crop_box = crop_masked_object(rgb_img, binary_mask, foreground_mask=foreground_mask)
-        self.keyframe_crops_buffer = [crop_pil]
+        crop_pil, crop_box, crop_mask_fg = crop_masked_object(
+            rgb_img, binary_mask, foreground_mask=foreground_mask, return_mask=True
+        )
 
         if R_cam_obj_init is None:
             R_cam_obj_init = np.eye(3, dtype=np.float64)
@@ -142,8 +187,8 @@ class BundleNeMOTracker:
             R_cam_obj_kf=R_cam_obj_init
         )
 
-        # 3. Decode frame 0 to extract canonical coordinates
-        dec_out, best_k = self.memory_bank.decode_query(crop_pil)
+        # 3. Decode frame 0 to extract canonical coordinates (foreground masked)
+        dec_out, best_k = self.memory_bank.decode_query(crop_pil, query_mask_crop=crop_mask_fg)
         pts3d_local = dec_out['pts3d'][best_k, 0].cpu().numpy()
         conf = dec_out['conf'][best_k, 0].cpu().numpy()
 
@@ -159,7 +204,7 @@ class BundleNeMOTracker:
                 )
                 print(f"[BundleNeMO] Automatically estimated metric scale: {self.metric_scale:.5f}")
             else:
-                self.metric_scale = 0.35577
+                self.metric_scale = AutomaticScaleEstimator.DEFAULT_SCALE
                 print(f"[BundleNeMO] Depth not provided; using metric scale {self.metric_scale}")
 
         # 5. Solve Initial Pose and Calibrate Canonical Body Alignment
@@ -181,6 +226,11 @@ class BundleNeMOTracker:
             success, T_pnp, inliers, inlier_ratio = self.corres_engine.solve_pnp(
                 pts3d_cand, pts2d_full, K
             )
+        else:
+            # Fallback if PnP failed on frame 0: ensure points are in metric scale (F7 fix)
+            pts3d_cand = pts3d_scaled
+            if R_cam_obj_init is not None:
+                self.memory_bank.set_canonical_alignment(np.eye(3))
 
         opt_res = self.optimizer.optimize_step(
             K=K,
@@ -193,6 +243,8 @@ class BundleNeMOTracker:
         )
         T_cam_obj = opt_res['T_cam_obj']
         self.last_T_cam_obj = T_cam_obj.copy()
+        if len(self.memory_bank.clusters) > 0:
+            self.memory_bank.clusters[0]['t_cam_obj'] = T_cam_obj[:3, 3].copy()
 
         # Register Anchor Node 0 in Keyframe Pose Graph (filter to inliers)
         sub_inl = inliers if (inliers is not None and len(inliers) >= 30) else np.arange(len(pts3d_cand))
@@ -260,15 +312,17 @@ class BundleNeMOTracker:
                 'inlier_ratio': 0.0,
                 'best_cluster': 0,
                 'keyframe_added': False,
-                'is_spike': False,
+                'is_spike': pred_res['is_spike'],
                 'elapsed_sec': elapsed,
                 'fps': 1.0 / max(1e-4, elapsed)
             }
 
-        crop_pil, crop_box = crop_masked_object(rgb_img, binary_mask, foreground_mask=foreground_mask)
+        crop_pil, crop_box, crop_mask_fg = crop_masked_object(
+            rgb_img, binary_mask, foreground_mask=foreground_mask, return_mask=True
+        )
 
-        # 1. NeMO Decode across memory bank
-        dec_out, best_cluster_idx = self.memory_bank.decode_query(crop_pil)
+        # 1. NeMO Decode across memory bank (foreground masked)
+        dec_out, best_cluster_idx = self.memory_bank.decode_query(crop_pil, query_mask_crop=crop_mask_fg)
         pts3d_local = dec_out['pts3d'][best_cluster_idx, 0].cpu().numpy()
         conf = dec_out['conf'][best_cluster_idx, 0].cpu().numpy()
 
@@ -301,11 +355,11 @@ class BundleNeMOTracker:
         T_cam_obj = opt_res['T_cam_obj']
         self.last_T_cam_obj = T_cam_obj.copy()
 
-        # 5. Check Keyframe Admission (strict rotation delta, cooldown, healthy inliers)
+        # 5. Check Keyframe Admission (strict rotation/translation delta, cooldown, healthy inliers)
         keyframe_added = False
-        R_for_kf_check = T_cam_obj[:3, :3] if self.alignment_mode != "gt" or R_cam_obj_gt is None else R_cam_obj_gt
+        pose_for_kf_check = T_cam_obj if self.alignment_mode != "gt" or R_cam_obj_gt is None else R_cam_obj_gt
         should_add, reason = self.memory_bank.should_register_keyframe(
-            current_R_cam_obj=R_for_kf_check,
+            current_R_cam_obj=pose_for_kf_check,
             current_inlier_ratio=inlier_ratio,
             frame_idx=self.frame_count
         )

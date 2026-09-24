@@ -37,12 +37,20 @@ def benchmark_one_video(method,video_dir):
     if len(tmp)>0:
       pred_mesh = trimesh.load(tmp[-1])
     else:
-      pred_mesh_file = sorted(glob.glob(f"{dir}/**/*mesh_normalized_space.obj",recursive=True))[-1]
-      print("pred_mesh_file",pred_mesh_file)
-      pred_mesh = trimesh.load(pred_mesh_file)
-      cfg = yaml.load(open(f"{os.path.dirname(pred_mesh_file)}/config.yml",'r'))
-      translation = np.array(cfg['translation'])
-      pred_mesh.vertices = pred_mesh.vertices/cfg['sc_factor'] - translation.reshape(1,3)
+      nemo_mesh = sorted(glob.glob(f"{dir}/**/textured_mesh.obj", recursive=True))
+      norm_mesh = sorted(glob.glob(f"{dir}/**/*mesh_normalized_space.obj", recursive=True))
+      if len(nemo_mesh) > 0:
+        pred_mesh = trimesh.load(nemo_mesh[-1])
+      elif len(norm_mesh) > 0:
+        pred_mesh_file = norm_mesh[-1]
+        print("pred_mesh_file",pred_mesh_file)
+        pred_mesh = trimesh.load(pred_mesh_file)
+        cfg = yaml.load(open(f"{os.path.dirname(pred_mesh_file)}/config.yml",'r'))
+        translation = np.array(cfg['translation'])
+        pred_mesh.vertices = pred_mesh.vertices/cfg['sc_factor'] - translation.reshape(1,3)
+      else:
+        print(f"Warning: No mesh found in {dir}, skipping mesh benchmarking.")
+        pred_mesh = None
 
   gt_poses = []
   ids = []
@@ -112,26 +120,29 @@ def benchmark_one_video(method,video_dir):
       if len(component.vertices)>best_size:
         best_size = len(component.vertices)
         best_component = component
+    if best_component is None and len(components) > 0:
+      best_component = max(components, key=lambda c: len(c.vertices))
     pred_mesh = best_component
 
-    pred_mesh.export(f'{args.log_dir}/pred_mesh_biggest_{video_name}.obj')
+    if pred_mesh is not None:
+      pred_mesh.export(f'{args.log_dir}/pred_mesh_biggest_{video_name}.obj')
 
-    pred_pts,_ = trimesh.sample.sample_surface(pred_mesh, 99999, face_weight=None, sample_color=False)
+      pred_pts,_ = trimesh.sample.sample_surface(pred_mesh, 99999, face_weight=None, sample_color=False)
 
-    pcd_pred = toOpen3dCloud(pred_pts)
-    pcd_pred = pcd_pred.voxel_down_sample(0.005)
-    pcd_gt = toOpen3dCloud(gt_pts)
-    thres = 0.02
-    reg_p2p = o3d.pipelines.registration.registration_icp(pcd_pred, pcd_gt, thres, np.eye(4), o3d.pipelines.registration.TransformationEstimationPointToPoint())
-    pred_pts_icp = (reg_p2p.transformation@to_homo(pred_pts).T).T[:,:3]
-    chamfer_dists = chamfer_distance_between_clouds_mutual(pred_pts_icp, gt_pts)
-    cd = chamfer_dists.mean()*100
-    print("chamfer_dist(cm)",cd)
+      pcd_pred = toOpen3dCloud(pred_pts)
+      pcd_pred = pcd_pred.voxel_down_sample(0.005)
+      pcd_gt = toOpen3dCloud(gt_pts)
+      thres = 0.02
+      reg_p2p = o3d.pipelines.registration.registration_icp(pcd_pred, pcd_gt, thres, np.eye(4), o3d.pipelines.registration.TransformationEstimationPointToPoint())
+      pred_pts_icp = (reg_p2p.transformation@to_homo(pred_pts).T).T[:,:3]
+      chamfer_dists = chamfer_distance_between_clouds_mutual(pred_pts_icp, gt_pts)
+      cd = chamfer_dists.mean()*100
+      print("chamfer_dist(cm)",cd)
 
-    pcd = toOpen3dCloud(gt_pts)
-    o3d.io.write_point_cloud(f'{args.log_dir}/gt_pts_{video_name}.ply',pcd)
-    pcd = toOpen3dCloud(pred_pts)
-    o3d.io.write_point_cloud(f'{args.log_dir}/pred_pts_{video_name}.ply',pcd)
+      pcd = toOpen3dCloud(gt_pts)
+      o3d.io.write_point_cloud(f'{args.log_dir}/gt_pts_{video_name}.ply',pcd)
+      pcd = toOpen3dCloud(pred_pts)
+      o3d.io.write_point_cloud(f'{args.log_dir}/pred_pts_{video_name}.ply',pcd)
 
 
   print(f"video {video_name}, ADD-S_err: {adi_errs.mean()*100:.2f}[cm], ADD_errs: {add_errs.mean()*100:.2f}[cm], ADD-S_AUC: {ADDS_AUC:.2f}, ADD_AUC: {ADD_AUC:.2f}")
@@ -153,7 +164,6 @@ if __name__=='__main__':
 
   video_dirs = args.video_dirs.split(',')
   out_data = {}
-  args = []
   for video_dir in video_dirs:
     out = benchmark_one_video(method, video_dir)
     out_data.update(out)

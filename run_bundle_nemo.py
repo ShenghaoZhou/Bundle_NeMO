@@ -39,24 +39,39 @@ def decode_binary_mask_rle(data):
     return mask.reshape((data['height'], data['width'])).astype(np.uint8)
 
 
-def load_dataset_frames(data_dir):
+def load_dataset_frames(data_dir, camera_id=None):
     """
     Detect dataset format (HOT3D JSON-based or standard RGB-D directory).
     Returns list of dicts: {'rgb_path', 'depth_path', 'mask_path', 'K', 'gt_T_cam_obj'}
     """
     # Check for HOT3D format
-    hot3d_imgs = sorted(glob.glob(os.path.join(data_dir, "*.image_214-1.jpg")))
+    if camera_id is None:
+        if len(glob.glob(os.path.join(data_dir, "*.image_214-1.jpg"))) > 0:
+            camera_id = "214-1"
+        else:
+            all_jpgs = glob.glob(os.path.join(data_dir, "*.image_*.jpg"))
+            if len(all_jpgs) > 0:
+                parts = os.path.basename(all_jpgs[0]).split(".image_")
+                camera_id = parts[1].split(".jpg")[0] if len(parts) > 1 else None
+
+    pattern = f"*.image_{camera_id}.jpg" if camera_id else "*.image_*.jpg"
+    hot3d_imgs = sorted(glob.glob(os.path.join(data_dir, pattern)))
     if len(hot3d_imgs) > 0:
         frames = []
         for img_path in hot3d_imgs:
-            prefix = img_path.split(".image_214-1.jpg")[0]
+            # Extract camera ID from filename: <prefix>.image_<cam_id>.jpg
+            fname = os.path.basename(img_path)
+            parts = fname.split(".image_")
+            detected_cam_id = parts[1].split(".jpg")[0] if len(parts) > 1 else (camera_id or "214-1")
+            prefix = img_path.split(f".image_{detected_cam_id}.jpg")[0]
             obj_path = f"{prefix}.objects.json"
             cam_path = f"{prefix}.cameras.json"
             frames.append({
                 'type': 'hot3d',
                 'rgb_path': img_path,
                 'obj_path': obj_path,
-                'cam_path': cam_path
+                'cam_path': cam_path,
+                'camera_id': detected_cam_id
             })
         return frames
 
@@ -96,15 +111,17 @@ def quat_to_rot(q):
     ], dtype=np.float64)
 
 
-def read_frame_data(frame_info):
+def read_frame_data(frame_info, object_id=None):
     """Read RGB, Depth, Mask, Intrinsics, and optional World Poses."""
     T_w_cam = None
     T_w_obj_gt = None
 
     if frame_info['type'] == 'hot3d':
+        cam_id = frame_info.get('camera_id', '214-1')
         rgb = cv2.imread(frame_info['rgb_path'])[:, :, ::-1]  # BGR to RGB
         with open(frame_info['cam_path']) as f:
-            cam_data = json.load(f)['214-1']
+            all_cam_data = json.load(f)
+            cam_data = all_cam_data[cam_id] if cam_id in all_cam_data else list(all_cam_data.values())[0]
         fx, cx, cy = cam_data['calibration']['projection_params'][:3]
         K = np.array([[fx, 0, cx], [0, fx, cy], [0, 0, 1]], dtype=np.float32)
 
@@ -116,13 +133,18 @@ def read_frame_data(frame_info):
         # Read mask from objects.json
         with open(frame_info['obj_path']) as f:
             obj_data = json.load(f)
-            key = list(obj_data.keys())[0] if '26' not in obj_data else '26'
+            if object_id and object_id in obj_data:
+                key = object_id
+            elif '26' in obj_data:
+                key = '26'
+            else:
+                key = list(obj_data.keys())[0]
             toy = obj_data[key][0]
-            mask_rle = toy['masks_amodal']['214-1']
+            mask_rle = toy['masks_amodal'].get(cam_id, list(toy['masks_amodal'].values())[0])
             mask = decode_binary_mask_rle(mask_rle)
             mask_modal = None
-            if 'masks_modal' in toy and '214-1' in toy['masks_modal']:
-                mask_modal = decode_binary_mask_rle(toy['masks_modal']['214-1'])
+            if 'masks_modal' in toy and cam_id in toy['masks_modal']:
+                mask_modal = decode_binary_mask_rle(toy['masks_modal'][cam_id])
             if 'T_world_from_object' in toy:
                 T_w_obj_gt = np.eye(4, dtype=np.float64)
                 T_w_obj_gt[:3, :3] = quat_to_rot(toy['T_world_from_object']['quaternion_wxyz'])
@@ -153,6 +175,10 @@ def main():
                         help="Maximum number of frames to process")
     parser.add_argument("--metric_scale", type=float, default=None,
                         help="Fixed metric scale factor (leave None for auto-estimation)")
+    parser.add_argument("--camera_id", type=str, default=None,
+                        help="Camera ID to track (e.g. '214-1', or None for auto-detect)")
+    parser.add_argument("--object_id", type=str, default=None,
+                        help="Object ID to track in objects.json (or None for auto-detect)")
     parser.add_argument("--save_rrd", type=str, default=None,
                         help="Path to save Rerun .rrd recording")
     parser.add_argument("--decode_stride", type=int, default=1,
@@ -179,7 +205,7 @@ def main():
     model.eval()
 
     # 2. Discover sequence frames
-    frames = load_dataset_frames(os.path.abspath(args.data_dir))
+    frames = load_dataset_frames(os.path.abspath(args.data_dir), camera_id=args.camera_id)
     if args.max_frames is not None:
         frames = frames[:args.max_frames]
     total_frames = len(frames)
@@ -204,6 +230,7 @@ def main():
         print(f"[BundleNeMO] Streaming Rerun recording to {args.save_rrd}")
 
     trajectory = []
+    gt_c_o_list = []
     fps_list = []
     traj_w_est = []
     traj_w_gt = []
@@ -215,12 +242,14 @@ def main():
 
     # 4. Sequential Tracking Loop
     for idx, f_info in enumerate(frames):
-        rgb, depth, mask, K, T_w_cam, T_w_obj_gt, mask_modal = read_frame_data(f_info)
+        rgb, depth, mask, K, T_w_cam, T_w_obj_gt, mask_modal = read_frame_data(f_info, object_id=args.object_id)
 
         R_c_o_gt = None
+        T_c_o_gt = None
         if T_w_cam is not None and T_w_obj_gt is not None:
             T_c_o_gt = np.linalg.inv(T_w_cam) @ T_w_obj_gt
             R_c_o_gt = T_c_o_gt[:3, :3]
+            gt_c_o_list.append(T_c_o_gt.copy())
 
         if idx == 0:
             res = tracker.process_first_frame(rgb, depth, mask, K, R_cam_obj_init=R_c_o_gt, foreground_mask=mask_modal)
@@ -272,6 +301,36 @@ def main():
     mean_fps = np.mean(fps_list) if len(fps_list) > 0 else 0.0
     print(f"[BundleNeMO] Tracking finished: {total_frames} frames processed at {mean_fps:.1f} mean FPS.")
 
+    # Quantitative Evaluation vs Ground Truth (if available)
+    eval_metrics = {}
+    if len(gt_c_o_list) == len(trajectory) and len(trajectory) > 0:
+        trans_errs = []
+        rot_errs = []
+        for T_est, T_gt in zip(trajectory, gt_c_o_list):
+            t_err = np.linalg.norm(T_est[:3, 3] - T_gt[:3, 3])
+            trans_errs.append(t_err)
+            R_diff = T_est[:3, :3] @ T_gt[:3, :3].T
+            tr = np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0)
+            rot_errs.append(float(np.rad2deg(np.arccos(tr))))
+
+        trans_rmse_cm = float(np.sqrt(np.mean(np.array(trans_errs) ** 2)) * 100.0)
+        mean_rot_err = float(np.mean(rot_errs))
+        median_rot_err = float(np.median(rot_errs))
+
+        print("\n" + "=" * 65)
+        print(" Quantitative Tracking Evaluation vs Ground Truth")
+        print("=" * 65)
+        print(f"  Translation RMSE:           {trans_rmse_cm:.2f} cm")
+        print(f"  Mean Rotation Error:        {mean_rot_err:.2f}°")
+        print(f"  Median Rotation Error:      {median_rot_err:.2f}°")
+        print("=" * 65 + "\n")
+
+        eval_metrics = {
+            'translation_rmse_cm': trans_rmse_cm,
+            'mean_rotation_error_deg': mean_rot_err,
+            'median_rotation_error_deg': median_rot_err
+        }
+
     # 5. Extract and Export Clean 3D Reconstructed Model
     print("[BundleNeMO] Extracting fused 3D canonical point cloud and Poisson mesh...")
     pcd = tracker.fusion.get_fused_point_cloud(filter_outliers=True)
@@ -306,7 +365,8 @@ def main():
         'metric_scale': float(tracker.metric_scale),
         'total_clusters': len(tracker.memory_bank.clusters),
         'fused_points_count': len(pcd.points),
-        'mesh_vertices': len(mesh.vertices) if mesh is not None else 0
+        'mesh_vertices': len(mesh.vertices) if mesh is not None else 0,
+        **eval_metrics
     }
     with open(os.path.join(args.out_dir, "tracking_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)

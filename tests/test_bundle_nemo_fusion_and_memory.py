@@ -7,6 +7,7 @@ from bundle_nemo.memory_bank import geodesic_angle_deg
 
 class TestFusionAndMemory(unittest.TestCase):
     def test_vectorized_integrate_points(self):
+        np.random.seed(42)
         fusion = CanonicalObjectFusion(voxel_size=0.005)
         # 100 points around origin
         pts = np.random.randn(100, 3) * 0.01
@@ -21,6 +22,7 @@ class TestFusionAndMemory(unittest.TestCase):
         self.assertGreater(len(pcd.points), 0)
 
     def test_icp_refinement(self):
+        np.random.seed(42)
         fusion = CanonicalObjectFusion(voxel_size=0.005)
         # Create base shape in fusion
         base_pts = np.random.randn(200, 3) * 0.02
@@ -28,13 +30,16 @@ class TestFusionAndMemory(unittest.TestCase):
         weights = np.ones(200) * 5.0
         fusion.integrate_points(base_pts, colors, weights)
 
-        # Create slightly shifted points (1mm shift)
-        shifted_pts = base_pts + np.array([0.001, 0.001, 0.001])
+        # Create slightly shifted points (2mm shift)
+        shift = np.array([0.002, -0.001, 0.001])
+        shifted_pts = base_pts + shift
         T_delta = fusion.refine_with_icp(shifted_pts, max_correspondence_dist=0.02)
         self.assertEqual(T_delta.shape, (4, 4))
-        # Translation norm should be small
-        trans_norm = np.linalg.norm(T_delta[:3, 3])
-        self.assertLess(trans_norm, 0.03)
+        # Refined points should be closer to base points
+        pts_refined = (shifted_pts @ T_delta[:3, :3].T) + T_delta[:3, 3]
+        init_dist = np.mean(np.linalg.norm(shifted_pts - base_pts, axis=-1))
+        refined_dist = np.mean(np.linalg.norm(pts_refined - base_pts, axis=-1))
+        self.assertLess(refined_dist, init_dist)
 
     def test_geodesic_angle(self):
         R1 = np.eye(3)
