@@ -30,7 +30,7 @@ class AlignedDynamicNeMOMemoryBank:
         self,
         model,
         device: torch.device,
-        min_keyframe_rot_deg: float = 28.0,
+        min_keyframe_rot_deg: float = 16.0,
         min_inlier_ratio_trigger: float = 0.20,
         min_keyframe_trans_m: float = 0.08
     ):
@@ -58,26 +58,28 @@ class AlignedDynamicNeMOMemoryBank:
         self,
         current_R_cam_obj: np.ndarray,
         current_inlier_ratio: float,
-        frame_idx: int = 0
+        frame_idx: int = 0,
+        is_gt_mode: bool = False
     ) -> Tuple[bool, str]:
         """
         Evaluate if a new keyframe memory cluster should be admitted into the bank.
         Triggers strictly when:
         1. Viewing angle difference >= min_keyframe_rot_deg or translation >= min_keyframe_trans_m.
-        2. Cooldown of at least 20 frames has elapsed.
-        3. Current inliers are healthy (>= min_inlier_ratio_trigger, not in severe occlusion).
+        2. Cooldown has elapsed (unless in GT mode).
+        3. Current inliers are healthy (unless in GT mode).
         """
         if len(self.clusters) == 0:
             return True, "Initial cluster"
 
-        # Enforce cooldown of 20 frames
-        last_frame = self.clusters[-1].get('frame_idx', 0)
-        if frame_idx - last_frame < 20:
-            return False, f"Cooldown active ({frame_idx - last_frame} < 20 frames)"
+        if not is_gt_mode:
+            # Enforce cooldown of 8 frames
+            last_frame = self.clusters[-1].get('frame_idx', 0)
+            if frame_idx - last_frame < 8:
+                return False, f"Cooldown active ({frame_idx - last_frame} < 8 frames)"
 
-        # Prevent adding keyframes during heavy hand occlusion
-        if current_inlier_ratio < self.min_inlier_ratio_trigger:
-            return False, f"Inlier ratio too low ({current_inlier_ratio:.1%} < {self.min_inlier_ratio_trigger:.1%})"
+            # Prevent adding keyframes during heavy hand occlusion
+            if current_inlier_ratio < self.min_inlier_ratio_trigger:
+                return False, f"Inlier ratio too low ({current_inlier_ratio:.1%} < {self.min_inlier_ratio_trigger:.1%})"
 
         # Handle full 4x4 pose or 3x3 rotation
         if current_R_cam_obj.shape == (4, 4):
@@ -114,10 +116,12 @@ class AlignedDynamicNeMOMemoryBank:
         R_cam_obj_kf: np.ndarray,
         frame_idx: int = 0,
         sample_points_count: int = 1500,
-        R_k_to_0_override: Optional[np.ndarray] = None
+        R_k_to_0_override: Optional[np.ndarray] = None,
+        T_obj_local: Optional[np.ndarray] = None
     ) -> Dict[str, Any]:
         """
         Feed-forward encode views into a new 3D Neural Memory Object cluster and align to canonical frame.
+        Supports multi-view crops (t >= 1) with view 0 anchoring the canonical reference.
         Takes <30 ms without backpropagation.
         """
         t0 = time.time()
@@ -159,24 +163,27 @@ class AlignedDynamicNeMOMemoryBank:
             'features_3d_updated': n['features_3d_updated'],
             'surface_points': surf,
             'R_k_to_0': R_k_to_0,
-            'center': c_k
+            'center': c_k,
+            'T_obj_local': T_obj_local.copy() if T_obj_local is not None else None
         }
         self.clusters.append(cluster_entry)
         self.features_stacked = torch.cat([c['features_3d_updated'] for c in self.clusters], dim=0)
 
         elapsed = time.time() - t0
-        print(f"[NeMO MemoryBank] Added '{name}' (Frame {frame_idx}) in {elapsed:.3f}s. Total clusters: {len(self.clusters)}")
+        print(f"[NeMO MemoryBank] Added '{name}' ({len(keyframe_crops)} views, Frame {frame_idx}) in {elapsed:.3f}s. Total clusters: {len(self.clusters)}")
         return cluster_entry
 
     def decode_query(
         self,
         query_img_crop: Image.Image,
-        query_mask_crop: Optional[np.ndarray] = None
+        query_mask_crop: Optional[np.ndarray] = None,
+        prior_R_cam_obj: Optional[np.ndarray] = None
     ) -> Tuple[Dict[str, torch.Tensor], int]:
         """
         Decode query image crop across all active memory clusters simultaneously.
         Uses cached single-pass DINOv2 feature extraction to avoid redundant backbone passes.
-        Selects the best cluster with highest inlier confidence, evaluated on foreground pixels.
+        Selects the best cluster with highest inlier confidence, evaluated on foreground pixels,
+        with optional geometric viewing angle gating via prior_R_cam_obj.
         """
         K = len(self.clusters)
 
@@ -201,9 +208,9 @@ class AlignedDynamicNeMOMemoryBank:
             with torch.no_grad():
                 dec_out = self.model.decode_images(t_input, self.features_stacked)
 
+        scores = []
         if query_mask_crop is not None:
             mask_t = torch.as_tensor(query_mask_crop > 0, device=self.device)
-            scores = []
             for k in range(K):
                 conf_k = dec_out['conf'][k, 0]
                 conf_fg = conf_k[mask_t]
@@ -212,12 +219,26 @@ class AlignedDynamicNeMOMemoryBank:
                 else:
                     score = float(conf_k.max().item() + 2.0 * conf_k.mean().item())
                 scores.append(score)
-            best_cluster_idx = int(np.argmax(scores))
         else:
             conf_maxs = dec_out['conf'].amax(dim=[-1, -2]).cpu().numpy().ravel()
             conf_means = dec_out['conf'].mean(dim=[-1, -2]).cpu().numpy().ravel()
-            score = conf_maxs + 2.0 * conf_means
-            best_cluster_idx = int(np.argmax(score))
+            scores = (conf_maxs + 2.0 * conf_means).tolist()
+
+        # Cluster Selection with Geometric Viewing Angle Guidance:
+        if prior_R_cam_obj is not None and len(self.clusters) > 1:
+            angles = np.array([geodesic_angle_deg(prior_R_cam_obj, c['R_cam_obj']) for c in self.clusters])
+            min_ang = float(np.min(angles))
+            # Candidate clusters within 15 degrees of the closest cluster
+            candidate_mask = (angles <= min_ang + 15.0)
+            candidate_indices = np.where(candidate_mask)[0]
+            if len(candidate_indices) == 1:
+                best_cluster_idx = int(candidate_indices[0])
+            else:
+                # Rank candidates by confidence score
+                cand_scores = [scores[i] for i in candidate_indices]
+                best_cluster_idx = int(candidate_indices[np.argmax(cand_scores)])
+        else:
+            best_cluster_idx = int(np.argmax(scores))
 
         return dec_out, best_cluster_idx
 
@@ -229,14 +250,23 @@ class AlignedDynamicNeMOMemoryBank:
     ) -> np.ndarray:
         """
         Transform local cluster 3D predictions to unified canonical metric coordinates:
-        1. Center by cluster centroid c_k: pts_centered = pts3d_local - c_k
-        2. Rotate to canonical frame: pts_canon = (pts_centered @ R_k_to_0.T) + c_0
-        3. Align to true body/BOP frame if calibrated: pts_canon = pts_canon @ R_canon_align.T
-        4. Scale to physical meters: pts_metric = pts_canon * scale
+        1. If T_obj_local SE(3) transform is available:
+           Map via full rigid rotation and translation without centroid collapse.
+        2. Fallback:
+           Center by cluster centroid c_k and rotate via R_k_to_0.
         """
-        c_k = self.clusters[cluster_idx]['center']
+        cluster = self.clusters[cluster_idx]
+        T_obj_local = cluster.get('T_obj_local')
+        if T_obj_local is not None:
+            pts_metric = pts3d_local * scale
+            R = T_obj_local[:3, :3]
+            t = T_obj_local[:3, 3]
+            pts_canon = np.matmul(pts_metric, R.T) + t
+            return pts_canon
+
+        c_k = cluster['center']
         c_0 = self.c0
-        R_k_to_0 = self.clusters[cluster_idx]['R_k_to_0']
+        R_k_to_0 = cluster['R_k_to_0']
 
         pts_centered = pts3d_local - c_k
         pts_canon = np.matmul(pts_centered, R_k_to_0.T) + c_0

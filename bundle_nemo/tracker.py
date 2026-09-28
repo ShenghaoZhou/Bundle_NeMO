@@ -7,7 +7,7 @@ from PIL import Image
 from typing import Optional, Dict, Any, Tuple, List, Union
 
 from .scale_estimator import AutomaticScaleEstimator
-from .memory_bank import AlignedDynamicNeMOMemoryBank
+from .memory_bank import AlignedDynamicNeMOMemoryBank, geodesic_angle_deg
 from .correspondence import NeMOCorrespondenceEngine
 from .optimizer import BundleNeMOOptimizer
 from .fusion import CanonicalObjectFusion
@@ -64,7 +64,7 @@ def crop_masked_object(
 
     # White canvas background
     canvas = np.ones((crop_rgb.shape[0], crop_rgb.shape[1], 3), dtype=np.uint8) * 255
-    if foreground_mask is not None:
+    if foreground_mask is not None and np.any(foreground_mask[ny1:ny2, nx1:nx2] > 0):
         crop_fg = foreground_mask[ny1:ny2, nx1:nx2]
         fg_mask = (crop_fg > 0)[..., None]
     else:
@@ -90,7 +90,7 @@ class BundleNeMOTracker:
         nemo_model,
         device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
         metric_scale: Optional[float] = None,
-        min_keyframe_rot_deg: float = 28.0,
+        min_keyframe_rot_deg: float = 20.0,
         min_inlier_ratio_trigger: float = 0.20,
         min_keyframe_trans_m: float = 0.08,
         voxel_size: float = 0.003,
@@ -143,7 +143,7 @@ class BundleNeMOTracker:
             max_step_rot_deg=max_step_rot_deg,
             device=self.device
         )
-        self.fusion = CanonicalObjectFusion(voxel_size=voxel_size)
+        self.fusion = CanonicalObjectFusion(voxel_size=voxel_size, min_observations=3)
 
         # Zero-GT Alignment Engines (Methods A, B, and C)
         self.zero_gt_aligner = ZeroGTAlignmentEngine(
@@ -157,6 +157,8 @@ class BundleNeMOTracker:
 
         self.frame_count = 0
         self.last_T_cam_obj: Optional[np.ndarray] = None
+        self.crop_buffer: List[Dict[str, Any]] = []
+        self.max_buffer_size: int = 25
 
     def process_first_frame(
         self,
@@ -165,7 +167,8 @@ class BundleNeMOTracker:
         binary_mask: np.ndarray,
         K: np.ndarray,
         R_cam_obj_init: Optional[np.ndarray] = None,
-        foreground_mask: Optional[np.ndarray] = None
+        foreground_mask: Optional[np.ndarray] = None,
+        T_cam_obj_init: Optional[np.ndarray] = None
     ) -> Dict[str, Any]:
         """
         Initialize the tracker with the initial frame observation.
@@ -212,6 +215,7 @@ class BundleNeMOTracker:
         success, T_pnp, inliers, inlier_ratio = self.corres_engine.solve_pnp(
             pts3d_scaled, pts2d_full, K
         )
+        T_cam_local_0 = T_pnp.copy() if success and T_pnp is not None else None
 
         if success and inliers is not None:
             R_cam_nemo0 = T_pnp[:3, :3]
@@ -242,9 +246,19 @@ class BundleNeMOTracker:
             inliers=inliers
         )
         T_cam_obj = opt_res['T_cam_obj']
+        if self.alignment_mode == "gt" and T_cam_obj_init is not None:
+            T_cam_obj = T_cam_obj_init.copy()
         self.last_T_cam_obj = T_cam_obj.copy()
         if len(self.memory_bank.clusters) > 0:
             self.memory_bank.clusters[0]['t_cam_obj'] = T_cam_obj[:3, 3].copy()
+            if T_cam_local_0 is not None:
+                self.memory_bank.clusters[0]['T_obj_local'] = np.linalg.inv(T_cam_obj) @ T_cam_local_0
+
+        self.crop_buffer.append({
+            'crop': crop_pil,
+            'T_cam_obj': T_cam_obj.copy(),
+            'frame_idx': 0
+        })
 
         # Register Anchor Node 0 in Keyframe Pose Graph (filter to inliers)
         sub_inl = inliers if (inliers is not None and len(inliers) >= 30) else np.arange(len(pts3d_cand))
@@ -257,11 +271,20 @@ class BundleNeMOTracker:
             K=K
         )
 
-        # 6. Fuse initial 3D points (subsampled with stride 4 to prevent clutter)
+        # 6. Fuse initial 3D points via camera-to-body projection
         if success and inliers is not None and len(inliers) > 0:
             stride = 4
             sub_inl = inliers[::stride]
-            inl_pts3d = pts3d_cand[sub_inl]
+            if T_cam_local_0 is not None:
+                pts_local_sub = pts3d_scaled[sub_inl]
+                R_l = T_cam_local_0[:3, :3]
+                t_l = T_cam_local_0[:3, 3]
+                pts_cam = (R_l @ pts_local_sub.T).T + t_l
+                R_co = T_cam_obj[:3, :3]
+                t_co = T_cam_obj[:3, 3]
+                inl_pts3d = (R_co.T @ (pts_cam - t_co).T).T
+            else:
+                inl_pts3d = pts3d_cand[sub_inl]
             u_inl = np.clip(np.round(pts2d_full[sub_inl, 0]).astype(int), 0, rgb_img.shape[1] - 1)
             v_inl = np.clip(np.round(pts2d_full[sub_inl, 1]).astype(int), 0, rgb_img.shape[0] - 1)
             colors = rgb_img[v_inl, u_inl].astype(np.float64) / 255.0
@@ -285,7 +308,8 @@ class BundleNeMOTracker:
         binary_mask: np.ndarray,
         K: np.ndarray,
         R_cam_obj_gt: Optional[np.ndarray] = None,
-        foreground_mask: Optional[np.ndarray] = None
+        foreground_mask: Optional[np.ndarray] = None,
+        T_cam_obj_gt: Optional[np.ndarray] = None
     ) -> Dict[str, Any]:
         """
         Process incoming video frame:
@@ -321,8 +345,14 @@ class BundleNeMOTracker:
             rgb_img, binary_mask, foreground_mask=foreground_mask, return_mask=True
         )
 
-        # 1. NeMO Decode across memory bank (foreground masked)
-        dec_out, best_cluster_idx = self.memory_bank.decode_query(crop_pil, query_mask_crop=crop_mask_fg)
+        # 1. NeMO Decode across memory bank (foreground masked with viewing angle guidance)
+        if self.alignment_mode == "gt" and (R_cam_obj_gt is not None or T_cam_obj_gt is not None):
+            prior_R = R_cam_obj_gt if R_cam_obj_gt is not None else T_cam_obj_gt[:3, :3]
+        else:
+            prior_R = self.last_T_cam_obj[:3, :3] if self.last_T_cam_obj is not None else None
+        dec_out, best_cluster_idx = self.memory_bank.decode_query(
+            crop_pil, query_mask_crop=crop_mask_fg, prior_R_cam_obj=prior_R
+        )
         pts3d_local = dec_out['pts3d'][best_cluster_idx, 0].cpu().numpy()
         conf = dec_out['conf'][best_cluster_idx, 0].cpu().numpy()
 
@@ -353,22 +383,32 @@ class BundleNeMOTracker:
             inliers=inliers
         )
         T_cam_obj = opt_res['T_cam_obj']
+        if self.alignment_mode == "gt" and T_cam_obj_gt is not None:
+            T_cam_obj = T_cam_obj_gt.copy()
         self.last_T_cam_obj = T_cam_obj.copy()
 
         # 5. Check Keyframe Admission (strict rotation/translation delta, cooldown, healthy inliers)
         keyframe_added = False
         pose_for_kf_check = T_cam_obj if self.alignment_mode != "gt" or R_cam_obj_gt is None else R_cam_obj_gt
+        is_gt = (self.alignment_mode == "gt")
         should_add, reason = self.memory_bank.should_register_keyframe(
             current_R_cam_obj=pose_for_kf_check,
             current_inlier_ratio=inlier_ratio,
-            frame_idx=self.frame_count
+            frame_idx=self.frame_count,
+            is_gt_mode=is_gt
         )
-        if should_add and success and len(inliers) >= 1500:
-            cluster_name = f"Cluster {len(self.memory_bank.clusters)} (Frame {self.frame_count})"
+        if is_gt:
+            kf_admit = should_add
+        else:
+            kf_admit = should_add and success and (inliers is not None and len(inliers) >= 1500)
 
-            if self.alignment_mode == "gt" and R_cam_obj_gt is not None:
+        if kf_admit:
+            cluster_name = f"Cluster {len(self.memory_bank.clusters)} (Frame {self.frame_count})"
+            selected_crops = [crop_pil]
+
+            if self.alignment_mode == "gt" and (R_cam_obj_gt is not None or T_cam_obj_gt is not None):
                 # Oracle mode: GT camera-object rotation
-                R_kf = R_cam_obj_gt
+                R_kf = R_cam_obj_gt if R_cam_obj_gt is not None else T_cam_obj_gt[:3, :3]
                 R_k_to_0 = self.memory_bank.R_ref0 @ R_kf.T
             elif self.alignment_mode == "pose_graph":
                 # Method C: BundleSDF-Style Keyframe Pose Graph Optimization & Multi-View BA
@@ -387,7 +427,7 @@ class BundleNeMOTracker:
                 print(f"[BundleNeMO PoseGraph BA (Method C)] Keyframe {node_id} optimized across {len(self.pose_graph.keyframes)} nodes")
             else:
                 # Method A + B: Cross-Cluster 3D Tie Points + Surface ICP Refinement
-                tensors = [image_to_tensor(crop_pil, device=self.device)]
+                tensors = [image_to_tensor(c, device=self.device) for c in selected_crops]
                 imgs_tensor = torch.cat(tensors, dim=0).unsqueeze(0)
                 sample_points = torch.rand(1, 1500, 3, device=self.device) * 2 - 1
                 with torch.no_grad():
@@ -409,12 +449,29 @@ class BundleNeMOTracker:
 
             self.memory_bank.add_cluster(
                 name=cluster_name,
-                keyframe_crops=[crop_pil],
+                keyframe_crops=selected_crops,
                 R_cam_obj_kf=R_kf,
                 frame_idx=self.frame_count,
                 R_k_to_0_override=R_k_to_0
             )
             keyframe_added = True
+
+            # Compute exact SE(3) body-to-local transform for newly admitted cluster
+            cl_idx = len(self.memory_bank.clusters) - 1
+            with torch.no_grad():
+                t_single = image_to_tensor(crop_pil, size=224, device=self.device, normalize=False).unsqueeze(1)
+                dec_new = self.model.decode_images(t_single, self.memory_bank.clusters[cl_idx]['features_3d_updated'])
+            pts_new_local = dec_new['pts3d'][0, 0].cpu().numpy()
+            conf_new = dec_new['conf'][0, 0].cpu().numpy()
+            pts2d_kf, pts3d_kf_local, _ = self.corres_engine.extract_correspondences(pts_new_local, conf_new, crop_box)
+            if len(pts3d_kf_local) >= 30:
+                succ_kf, T_cam_local_kf, inl_kf, _ = self.corres_engine.solve_pnp(
+                    pts3d_kf_local * self.metric_scale, pts2d_kf, K
+                )
+                if succ_kf and T_cam_local_kf is not None:
+                    # T_obj_local = T_cam_obj^-1 @ T_cam_local
+                    T_obj_local_k = np.linalg.inv(T_cam_obj) @ T_cam_local_kf
+                    self.memory_bank.clusters[cl_idx]['T_obj_local'] = T_obj_local_k
 
             # Additional ICP refinement if requested and not already done in cross_icp
             if self.use_icp_refinement and self.alignment_mode != "cross_icp":
@@ -427,16 +484,42 @@ class BundleNeMOTracker:
                     self.memory_bank.clusters[cl_idx]['R_k_to_0'] = Delta_R @ self.memory_bank.clusters[cl_idx]['R_k_to_0']
                     print(f"[BundleNeMO] Applied ICP alignment refinement to {cluster_name}")
 
-        # 6. Integrate 3D surface points into Canonical Fusion (subsampled)
+        # 6. Integrate 3D surface points into Canonical Fusion via per-frame camera-to-body projection
         if success and inliers is not None and len(inliers) > 0:
-            stride = 4
-            sub_inl = inliers[::stride]
-            inl_pts3d = pts3d_cand[sub_inl]
-            u_inl = np.clip(np.round(pts2d_full[sub_inl, 0]).astype(int), 0, rgb_img.shape[1] - 1)
-            v_inl = np.clip(np.round(pts2d_full[sub_inl, 1]).astype(int), 0, rgb_img.shape[0] - 1)
-            colors = rgb_img[v_inl, u_inl].astype(np.float64) / 255.0
-            weights = conf_valid[sub_inl]
-            self.fusion.integrate_points(inl_pts3d, colors, weights)
+            # Solve PnP directly on raw NeMO local predictions for this query frame
+            _, pts3d_local_raw, _ = self.corres_engine.extract_correspondences(
+                pts3d_local, conf, crop_box
+            )
+            pts_fused = None
+            if len(pts3d_local_raw) >= 30:
+                succ_l, T_cam_local, inl_l, _ = self.corres_engine.solve_pnp(
+                    pts3d_local_raw * self.metric_scale, pts2d_full, K
+                )
+                if succ_l and inl_l is not None and len(inl_l) >= 30:
+                    stride = 4
+                    sub_l = inl_l[::stride]
+                    pts_local_sub = pts3d_local_raw[sub_l] * self.metric_scale
+                    R_l = T_cam_local[:3, :3]
+                    t_l = T_cam_local[:3, 3]
+                    pts_cam = (R_l @ pts_local_sub.T).T + t_l
+
+                    R_co = T_cam_obj[:3, :3]
+                    t_co = T_cam_obj[:3, 3]
+                    inl_pts3d_body = (R_co.T @ (pts_cam - t_co).T).T
+
+                    u_inl = np.clip(np.round(pts2d_full[sub_l, 0]).astype(int), 0, rgb_img.shape[1] - 1)
+                    v_inl = np.clip(np.round(pts2d_full[sub_l, 1]).astype(int), 0, rgb_img.shape[0] - 1)
+                    colors = rgb_img[v_inl, u_inl].astype(np.float64) / 255.0
+                    weights = conf_valid[sub_l]
+                    self.fusion.integrate_points(inl_pts3d_body, colors, weights)
+                    pts_fused = inl_pts3d_body
+        self.crop_buffer.append({
+            'crop': crop_pil,
+            'T_cam_obj': T_cam_obj.copy(),
+            'frame_idx': self.frame_count
+        })
+        if len(self.crop_buffer) > self.max_buffer_size:
+            self.crop_buffer.pop(0)
 
         self.frame_count += 1
         elapsed = time.time() - t0

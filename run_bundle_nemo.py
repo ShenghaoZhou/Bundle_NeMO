@@ -139,16 +139,28 @@ def read_frame_data(frame_info, object_id=None):
                 key = '26'
             else:
                 key = list(obj_data.keys())[0]
-            toy = obj_data[key][0]
-            mask_rle = toy['masks_amodal'].get(cam_id, list(toy['masks_amodal'].values())[0])
-            mask = decode_binary_mask_rle(mask_rle)
-            mask_modal = None
-            if 'masks_modal' in toy and cam_id in toy['masks_modal']:
-                mask_modal = decode_binary_mask_rle(toy['masks_modal'][cam_id])
-            if 'T_world_from_object' in toy:
-                T_w_obj_gt = np.eye(4, dtype=np.float64)
-                T_w_obj_gt[:3, :3] = quat_to_rot(toy['T_world_from_object']['quaternion_wxyz'])
-                T_w_obj_gt[:3, 3] = toy['T_world_from_object']['translation_xyz']
+
+            if key in obj_data and len(obj_data[key]) > 0:
+                toy = obj_data[key][0]
+                mask = np.zeros((rgb.shape[0], rgb.shape[1]), dtype=np.uint8)
+                if 'masks_amodal' in toy and toy['masks_amodal'] and cam_id in toy['masks_amodal']:
+                    mask_rle = toy['masks_amodal'][cam_id]
+                    if mask_rle is not None:
+                        mask = decode_binary_mask_rle(mask_rle)
+
+                mask_modal = None
+                if 'masks_modal' in toy and toy['masks_modal'] and cam_id in toy['masks_modal']:
+                    mask_m_rle = toy['masks_modal'][cam_id]
+                    if mask_m_rle is not None:
+                        mask_modal = decode_binary_mask_rle(mask_m_rle)
+
+                if 'T_world_from_object' in toy and toy['T_world_from_object']:
+                    T_w_obj_gt = np.eye(4, dtype=np.float64)
+                    T_w_obj_gt[:3, :3] = quat_to_rot(toy['T_world_from_object']['quaternion_wxyz'])
+                    T_w_obj_gt[:3, 3] = toy['T_world_from_object']['translation_xyz']
+            else:
+                mask = np.zeros((rgb.shape[0], rgb.shape[1]), dtype=np.uint8)
+                mask_modal = None
 
         depth = None
         return rgb, depth, mask, K, T_w_cam, T_w_obj_gt, mask_modal
@@ -252,9 +264,9 @@ def main():
             gt_c_o_list.append(T_c_o_gt.copy())
 
         if idx == 0:
-            res = tracker.process_first_frame(rgb, depth, mask, K, R_cam_obj_init=R_c_o_gt, foreground_mask=mask_modal)
+            res = tracker.process_first_frame(rgb, depth, mask, K, R_cam_obj_init=R_c_o_gt, foreground_mask=mask_modal, T_cam_obj_init=T_c_o_gt)
         else:
-            res = tracker.process_frame(rgb, depth, mask, K, R_cam_obj_gt=R_c_o_gt, foreground_mask=mask_modal)
+            res = tracker.process_frame(rgb, depth, mask, K, R_cam_obj_gt=R_c_o_gt, foreground_mask=mask_modal, T_cam_obj_gt=T_c_o_gt)
 
         T_cam_obj = res['T_cam_obj']
         trajectory.append(T_cam_obj)
@@ -331,6 +343,35 @@ def main():
             'median_rotation_error_deg': median_rot_err
         }
 
+    def render_4views(geom, out_path, is_mesh=False):
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(visible=False, width=640, height=480)
+        vis.add_geometry(geom)
+        ctr = vis.get_view_control()
+        opt = vis.get_render_option()
+        if not is_mesh:
+            opt.point_size = 3.0
+        opt.background_color = np.array([0.15, 0.15, 0.15])
+        angles = [(0, 0), (90, 0), (180, 0), (0, 75)]
+        labels = ['Front View', 'Right Side View', 'Back View', 'Top View']
+        images = []
+        for az, el in angles:
+            ctr.set_zoom(0.7)
+            ctr.rotate(az * 10.0, el * 10.0)
+            vis.poll_events()
+            vis.update_renderer()
+            img = vis.capture_screen_float_buffer(do_render=True)
+            img_np = (np.asarray(img) * 255).astype(np.uint8)
+            cv2.putText(img_np, f'{labels[len(images)]}', (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            images.append(img_np)
+        vis.destroy_window()
+        top_row = np.concatenate([images[0], images[1]], axis=1)
+        bot_row = np.concatenate([images[2], images[3]], axis=1)
+        grid = np.concatenate([top_row, bot_row], axis=0)
+        cv2.imwrite(out_path, cv2.cvtColor(grid, cv2.COLOR_RGB2BGR))
+        print(f"  -> Exported 4-view projection render to {out_path}")
+
     # 5. Extract and Export Clean 3D Reconstructed Model
     print("[BundleNeMO] Extracting fused 3D canonical point cloud and Poisson mesh...")
     pcd = tracker.fusion.get_fused_point_cloud(filter_outliers=True)
@@ -338,11 +379,16 @@ def main():
     o3d.io.write_point_cloud(pcd_path, pcd)
     print(f"  -> Exported point cloud ({len(pcd.points)} points) to {pcd_path}")
 
+    pcd_png = os.path.join(args.out_dir, "fused_projections.png")
+    render_4views(pcd, pcd_png, is_mesh=False)
+
     mesh = tracker.fusion.extract_poisson_mesh(depth=8)
     if mesh is not None:
         mesh_path = os.path.join(args.out_dir, "textured_mesh.obj")
         o3d.io.write_triangle_mesh(mesh_path, mesh)
         print(f"  -> Exported Poisson mesh ({len(mesh.vertices)} vertices, {len(mesh.triangles)} faces) to {mesh_path}")
+        mesh_png = os.path.join(args.out_dir, "mesh_projections.png")
+        render_4views(mesh, mesh_png, is_mesh=True)
 
     if args.save_rrd:
         if len(traj_w_est) > 1:
