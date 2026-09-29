@@ -250,20 +250,12 @@ class AlignedDynamicNeMOMemoryBank:
     ) -> np.ndarray:
         """
         Transform local cluster 3D predictions to unified canonical metric coordinates:
-        1. If T_obj_local SE(3) transform is available:
-           Map via full rigid rotation and translation without centroid collapse.
-        2. Fallback:
-           Center by cluster centroid c_k and rotate via R_k_to_0.
+        1. Center by cluster centroid c_k: pts_centered = pts3d_local - c_k
+        2. Rotate to canonical frame: pts_canon = (pts_centered @ R_k_to_0.T) + c_0
+        3. Align to true body/BOP frame if calibrated: pts_canon = pts_canon @ R_canon_align.T
+        4. Scale to physical meters: pts_metric = pts_canon * scale
         """
         cluster = self.clusters[cluster_idx]
-        T_obj_local = cluster.get('T_obj_local')
-        if T_obj_local is not None:
-            pts_metric = pts3d_local * scale
-            R = T_obj_local[:3, :3]
-            t = T_obj_local[:3, 3]
-            pts_canon = np.matmul(pts_metric, R.T) + t
-            return pts_canon
-
         c_k = cluster['center']
         c_0 = self.c0
         R_k_to_0 = cluster['R_k_to_0']

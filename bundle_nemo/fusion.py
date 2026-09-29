@@ -14,8 +14,8 @@ class CanonicalObjectFusion:
     """
     def __init__(
         self,
-        voxel_size: float = 0.003,      # 3 mm voxel resolution
-        min_observations: int = 4,       # Prune voxels observed in < 4 frames
+        voxel_size: float = 0.002,      # 2 mm voxel resolution
+        min_observations: int = 1,       # Keep keyframe observations
         outlier_nb_neighbors: int = 30,
         outlier_std_ratio: float = 1.2
     ):
@@ -164,7 +164,13 @@ class CanonicalObjectFusion:
         pcd.estimate_normals(
             search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.015, max_nn=30)
         )
-        pcd.orient_normals_consistent_tangent_plane(k=15)
+        pts = np.asarray(pcd.points)
+        c = pts.mean(axis=0)
+        v_out = pts - c
+        normals = np.asarray(pcd.normals)
+        dots = (normals * v_out).sum(axis=-1)
+        normals[dots < 0] = -normals[dots < 0]
+        pcd.normals = o3d.utility.Vector3dVector(normals)
 
         mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
             pcd, depth=depth, linear_fit=True

@@ -271,25 +271,25 @@ class BundleNeMOTracker:
             K=K
         )
 
-        # 6. Fuse initial 3D points via camera-to-body projection
-        if success and inliers is not None and len(inliers) > 0:
-            stride = 4
-            sub_inl = inliers[::stride]
-            if T_cam_local_0 is not None:
-                pts_local_sub = pts3d_scaled[sub_inl]
-                R_l = T_cam_local_0[:3, :3]
-                t_l = T_cam_local_0[:3, 3]
-                pts_cam = (R_l @ pts_local_sub.T).T + t_l
-                R_co = T_cam_obj[:3, :3]
-                t_co = T_cam_obj[:3, 3]
-                inl_pts3d = (R_co.T @ (pts_cam - t_co).T).T
-            else:
-                inl_pts3d = pts3d_cand[sub_inl]
-            u_inl = np.clip(np.round(pts2d_full[sub_inl, 0]).astype(int), 0, rgb_img.shape[1] - 1)
-            v_inl = np.clip(np.round(pts2d_full[sub_inl, 1]).astype(int), 0, rgb_img.shape[0] - 1)
-            colors = rgb_img[v_inl, u_inl].astype(np.float64) / 255.0
-            weights = conf_valid[sub_inl]
-            self.fusion.integrate_points(inl_pts3d, colors, weights)
+        # 6. Fuse initial 3D canonical surface points
+        if len(self.memory_bank.clusters) > 0:
+            cl_idx = 0
+            surf = self.memory_bank.clusters[cl_idx]['surface_points']
+            pts_canon = self.memory_bank.get_canonical_3d_points(cl_idx, surf, scale=self.metric_scale)
+            P_cam = (T_cam_obj[:3, :3] @ pts_canon.T).T + T_cam_obj[:3, 3]
+            u = np.round(K[0, 0] * P_cam[:, 0] / P_cam[:, 2] + K[0, 2]).astype(int)
+            v = np.round(K[1, 1] * P_cam[:, 1] / P_cam[:, 2] + K[1, 2]).astype(int)
+            H, W = rgb_img.shape[:2]
+            valid = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (P_cam[:, 2] > 0)
+            obj_m = (binary_mask > 0) if foreground_mask is None else ((binary_mask > 0) & (foreground_mask > 0))
+            in_mask = valid & (obj_m[np.clip(v, 0, H-1), np.clip(u, 0, W-1)])
+            colors = np.ones((len(pts_canon), 3), dtype=np.float64) * 0.5
+            if in_mask.sum() > 0:
+                colors[in_mask] = rgb_img[v[in_mask], u[in_mask]] / 255.0
+                colors[~in_mask] = colors[in_mask].mean(axis=0)
+            weights = np.ones(len(pts_canon), dtype=np.float64)
+            weights[in_mask] = 2.0
+            self.fusion.integrate_points(pts_canon, colors, weights)
 
         self.frame_count = 1
         return {
@@ -444,7 +444,7 @@ class BundleNeMOTracker:
                     fallback_R=T_cam_obj[:3, :3],
                     scale=self.metric_scale
                 )
-                R_kf = self.memory_bank.R_ref0.T @ R_k_to_0
+                R_kf = R_k_to_0.T @ self.memory_bank.R_ref0
                 print(f"[BundleNeMO Zero-GT A+B] {cluster_name} aligned: {align_info}")
 
             self.memory_bank.add_cluster(
@@ -484,35 +484,27 @@ class BundleNeMOTracker:
                     self.memory_bank.clusters[cl_idx]['R_k_to_0'] = Delta_R @ self.memory_bank.clusters[cl_idx]['R_k_to_0']
                     print(f"[BundleNeMO] Applied ICP alignment refinement to {cluster_name}")
 
-        # 6. Integrate 3D surface points into Canonical Fusion via per-frame camera-to-body projection
-        if success and inliers is not None and len(inliers) > 0:
-            # Solve PnP directly on raw NeMO local predictions for this query frame
-            _, pts3d_local_raw, _ = self.corres_engine.extract_correspondences(
-                pts3d_local, conf, crop_box
-            )
-            pts_fused = None
-            if len(pts3d_local_raw) >= 30:
-                succ_l, T_cam_local, inl_l, _ = self.corres_engine.solve_pnp(
-                    pts3d_local_raw * self.metric_scale, pts2d_full, K
-                )
-                if succ_l and inl_l is not None and len(inl_l) >= 30:
-                    stride = 4
-                    sub_l = inl_l[::stride]
-                    pts_local_sub = pts3d_local_raw[sub_l] * self.metric_scale
-                    R_l = T_cam_local[:3, :3]
-                    t_l = T_cam_local[:3, 3]
-                    pts_cam = (R_l @ pts_local_sub.T).T + t_l
-
-                    R_co = T_cam_obj[:3, :3]
-                    t_co = T_cam_obj[:3, 3]
-                    inl_pts3d_body = (R_co.T @ (pts_cam - t_co).T).T
-
-                    u_inl = np.clip(np.round(pts2d_full[sub_l, 0]).astype(int), 0, rgb_img.shape[1] - 1)
-                    v_inl = np.clip(np.round(pts2d_full[sub_l, 1]).astype(int), 0, rgb_img.shape[0] - 1)
-                    colors = rgb_img[v_inl, u_inl].astype(np.float64) / 255.0
-                    weights = conf_valid[sub_l]
-                    self.fusion.integrate_points(inl_pts3d_body, colors, weights)
-                    pts_fused = inl_pts3d_body
+        # 6. Integrate newly added keyframe cluster canonical surface points into Canonical Fusion
+        if keyframe_added and len(self.memory_bank.clusters) > 0:
+            cl_idx = len(self.memory_bank.clusters) - 1
+            surf = self.memory_bank.clusters[cl_idx]['surface_points']
+            pts_canon = self.memory_bank.get_canonical_3d_points(cl_idx, surf, scale=self.metric_scale)
+            P_cam = (T_cam_obj[:3, :3] @ pts_canon.T).T + T_cam_obj[:3, 3]
+            u = np.round(K[0, 0] * P_cam[:, 0] / P_cam[:, 2] + K[0, 2]).astype(int)
+            v = np.round(K[1, 1] * P_cam[:, 1] / P_cam[:, 2] + K[1, 2]).astype(int)
+            H, W = rgb_img.shape[:2]
+            valid = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (P_cam[:, 2] > 0)
+            obj_m = (binary_mask > 0) if foreground_mask is None else ((binary_mask > 0) & (foreground_mask > 0))
+            in_mask = valid & (obj_m[np.clip(v, 0, H-1), np.clip(u, 0, W-1)])
+            colors = np.ones((len(pts_canon), 3), dtype=np.float64) * 0.5
+            if in_mask.sum() > 0:
+                colors[in_mask] = rgb_img[v[in_mask], u[in_mask]] / 255.0
+                colors[~in_mask] = colors[in_mask].mean(axis=0)
+            weights = np.ones(len(pts_canon), dtype=np.float64)
+            weights[in_mask] = 2.0
+            self.fusion.integrate_points(pts_canon, colors, weights)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         self.crop_buffer.append({
             'crop': crop_pil,
             'T_cam_obj': T_cam_obj.copy(),
