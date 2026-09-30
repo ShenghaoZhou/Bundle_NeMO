@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--data_dir", default=os.path.abspath("../data/hot3d/extracted/clip-003312"))
     parser.add_argument("--growing_dir", default=os.path.join(current_dir, "outputs", "hot3d_3312_growing_bundlenemo"))
     parser.add_argument("--baseline_dir", default=os.path.join(current_dir, "outputs", "hot3d_3312_full_clip"))
+    parser.add_argument("--object_id", default="26", help="BOP object ID (default: 26)")
     parser.add_argument("--out_rrd", default=None, help="Output .rrd path (default: <growing_dir>/growing_bundlenemo_comparison.rrd)")
     args = parser.parse_args()
 
@@ -91,7 +92,7 @@ def main():
     print(f"[Rerun] Streaming {num_frames} frames to {rrd_path}...")
     for idx in range(num_frames):
         f_info = frames[idx]
-        rgb, depth, mask, K, T_w_cam, T_w_obj_gt, mask_modal = read_frame_data(f_info, object_id="26")
+        rgb, depth, mask, K, T_w_cam, T_w_obj_gt, mask_modal = read_frame_data(f_info, object_id=args.object_id)
 
         T_c_o_grow = np.loadtxt(growing_pose_files[idx])
         T_w_o_grow = T_w_cam @ T_c_o_grow if T_w_cam is not None else T_c_o_grow
