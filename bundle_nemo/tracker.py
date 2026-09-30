@@ -217,13 +217,21 @@ class BundleNeMOTracker:
             pts3d_local, conf, crop_box
         )
 
-        # 4. Automatic Scale Calibration from depth
+        # 4. Automatic Scale Calibration from depth or initial pose
         if not self.scale_is_fixed:
             if depth_map is not None:
                 self.metric_scale = AutomaticScaleEstimator.estimate_scale_from_depth(
                     pts3d_cand, pts2d_full, depth_map, K, conf_weights=conf_valid
                 )
-                print(f"[BundleNeMO] Automatically estimated metric scale: {self.metric_scale:.5f}")
+                print(f"[BundleNeMO] Automatically estimated metric scale from depth: {self.metric_scale:.5f}")
+            elif T_cam_obj_init is not None:
+                succ_u, T_unit, _, _ = self.corres_engine.solve_pnp(pts3d_cand, pts2d_full, K)
+                if succ_u and np.linalg.norm(T_unit[:3, 3]) > 1e-4:
+                    self.metric_scale = float(np.linalg.norm(T_cam_obj_init[:3, 3]) / np.linalg.norm(T_unit[:3, 3]))
+                    print(f"[BundleNeMO] Automatically calibrated metric scale from initial pose: {self.metric_scale:.5f}")
+                else:
+                    self.metric_scale = AutomaticScaleEstimator.DEFAULT_SCALE
+                    print(f"[BundleNeMO] Using fallback default metric scale: {self.metric_scale}")
             else:
                 self.metric_scale = AutomaticScaleEstimator.DEFAULT_SCALE
                 print(f"[BundleNeMO] Depth not provided; using metric scale {self.metric_scale}")
