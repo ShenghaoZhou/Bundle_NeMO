@@ -200,6 +200,14 @@ def main():
     parser.add_argument("--alignment_mode", type=str, default="cross_icp",
                         choices=["cross_icp", "pose_graph", "gt"],
                         help="Cluster alignment strategy: cross_icp (Method A+B, Zero-GT), pose_graph (Method C, Zero-GT), or gt (Oracle)")
+    parser.add_argument("--use_growing_nemo", action="store_true",
+                        help="Use native Incremental NeMO (GrowingNeMO) with CrossViewEncoder fusion and novelty triggers")
+    parser.add_argument("--growing_max_keyframes", type=int, default=10,
+                        help="Maximum keyframes to maintain in GrowingNeMO buffer")
+    parser.add_argument("--growing_conf_threshold", type=float, default=0.45,
+                        help="Confidence coverage novelty trigger threshold for GrowingNeMO")
+    parser.add_argument("--growing_inlier_threshold", type=float, default=0.20,
+                        help="Inlier ratio novelty trigger threshold for GrowingNeMO")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -208,7 +216,8 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[BundleNeMO] Device: {device}")
-    print(f"[BundleNeMO] Alignment Mode: {args.alignment_mode.upper()} {'(ZERO-GT / FULLY AUTONOMOUS)' if args.alignment_mode != 'gt' else '(ORACLE REFERENCE)'}")
+    backend_str = "GROWING NEMO (NATIVE CROSS-VIEW ENCODER FUSION)" if args.use_growing_nemo else f"{args.alignment_mode.upper()} {'(ZERO-GT / FULLY AUTONOMOUS)' if args.alignment_mode != 'gt' else '(ORACLE REFERENCE)'}"
+    print(f"[BundleNeMO] Memory Backend: {backend_str}")
 
     # 1. Load NeMO Model
     ckpt_path = os.path.abspath(args.checkpoint)
@@ -230,7 +239,11 @@ def main():
         metric_scale=args.metric_scale,
         decode_stride=args.decode_stride,
         use_icp_refinement=(not args.no_icp),
-        alignment_mode=args.alignment_mode
+        alignment_mode=args.alignment_mode,
+        use_growing_nemo=args.use_growing_nemo,
+        growing_max_keyframes=args.growing_max_keyframes,
+        growing_conf_threshold=args.growing_conf_threshold,
+        growing_inlier_threshold=args.growing_inlier_threshold
     )
 
     if args.save_rrd:
@@ -316,32 +329,46 @@ def main():
     # Quantitative Evaluation vs Ground Truth (if available)
     eval_metrics = {}
     if len(gt_c_o_list) == len(trajectory) and len(trajectory) > 0:
-        trans_errs = []
-        rot_errs = []
-        for T_est, T_gt in zip(trajectory, gt_c_o_list):
-            t_err = np.linalg.norm(T_est[:3, 3] - T_gt[:3, 3])
-            trans_errs.append(t_err)
-            R_diff = T_est[:3, :3] @ T_gt[:3, :3].T
-            tr = np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0)
-            rot_errs.append(float(np.rad2deg(np.arccos(tr))))
-
-        trans_rmse_cm = float(np.sqrt(np.mean(np.array(trans_errs) ** 2)) * 100.0)
-        mean_rot_err = float(np.mean(rot_errs))
-        median_rot_err = float(np.median(rot_errs))
+        from evaluate_tracking import evaluate_trajectory
+        eval_metrics = evaluate_trajectory(np.array(trajectory), np.array(gt_c_o_list))
 
         print("\n" + "=" * 65)
-        print(" Quantitative Tracking Evaluation vs Ground Truth")
+        print(" Quantitative Tracking Evaluation vs Ground Truth (ATE)")
         print("=" * 65)
-        print(f"  Translation RMSE:           {trans_rmse_cm:.2f} cm")
-        print(f"  Mean Rotation Error:        {mean_rot_err:.2f}°")
-        print(f"  Median Rotation Error:      {median_rot_err:.2f}°")
+        print(f"  Frames Evaluated:              {eval_metrics['num_frames']}")
+        print(f"  Raw Translation RMSE:          {eval_metrics['raw_translation_rmse_cm']:.2f} cm")
+        print(f"  Raw Translation Mean:          {eval_metrics['raw_translation_mean_cm']:.2f} cm")
+        print(f"  SE(3) Aligned ATE RMSE:        {eval_metrics['se3_ate_rmse_cm']:.2f} cm")
+        print(f"  SE(3) Aligned ATE Mean:        {eval_metrics['se3_ate_mean_cm']:.2f} cm")
+        print(f"  SE(3) Aligned ATE Median:      {eval_metrics['se3_ate_median_cm']:.2f} cm")
+        print(f"  Sim(3) Aligned ATE RMSE:       {eval_metrics['sim3_ate_rmse_cm']:.2f} cm (scale={eval_metrics['sim3_ate_scale']:.4f})")
+        print(f"  Mean Geodesic Rotation Error:  {eval_metrics['mean_rotation_error_deg']:.2f}°")
+        print(f"  Median Geodesic Rotation Error:{eval_metrics['median_rotation_error_deg']:.2f}°")
+        print(f"  Rotation RMSE:                 {eval_metrics['rotation_rmse_deg']:.2f}°")
         print("=" * 65 + "\n")
 
-        eval_metrics = {
-            'translation_rmse_cm': trans_rmse_cm,
-            'mean_rotation_error_deg': mean_rot_err,
-            'median_rotation_error_deg': median_rot_err
-        }
+        # Check for baseline comparison
+        baseline_poses_dir = os.path.join(current_dir, "outputs", "hot3d_3312_full_clip", "ob_in_cam")
+        if os.path.isdir(baseline_poses_dir):
+            base_files = sorted(glob.glob(os.path.join(baseline_poses_dir, "*.txt")))
+            if len(base_files) == len(trajectory):
+                base_poses = np.array([np.loadtxt(f) for f in base_files])
+                base_metrics = evaluate_trajectory(base_poses, np.array(gt_c_o_list))
+
+                print("\n" + "=" * 80)
+                print(" SIDE-BY-SIDE TRAJECTORY ATE BENCHMARK COMPARISON")
+                print("=" * 80)
+                print(f"{'Metric':<35}{'Baseline (Clusters)':<22}{'GrowingNeMO (Unified)':<22}")
+                print("-" * 80)
+                print(f"{'Raw Translation RMSE (cm)':<35}{base_metrics['raw_translation_rmse_cm']:<22.2f}{eval_metrics['raw_translation_rmse_cm']:<22.2f}")
+                print(f"{'Raw Translation Mean (cm)':<35}{base_metrics['raw_translation_mean_cm']:<22.2f}{eval_metrics['raw_translation_mean_cm']:<22.2f}")
+                print(f"{'SE(3) Aligned ATE RMSE (cm)':<35}{base_metrics['se3_ate_rmse_cm']:<22.2f}{eval_metrics['se3_ate_rmse_cm']:<22.2f}")
+                print(f"{'SE(3) Aligned ATE Mean (cm)':<35}{base_metrics['se3_ate_mean_cm']:<22.2f}{eval_metrics['se3_ate_mean_cm']:<22.2f}")
+                print(f"{'Sim(3) Aligned ATE RMSE (cm)':<35}{base_metrics['sim3_ate_rmse_cm']:<22.2f}{eval_metrics['sim3_ate_rmse_cm']:<22.2f}")
+                print(f"{'Mean Geodesic Rot Err (deg)':<35}{base_metrics['mean_rotation_error_deg']:<22.2f}{eval_metrics['mean_rotation_error_deg']:<22.2f}")
+                print(f"{'Median Geodesic Rot Err (deg)':<35}{base_metrics['median_rotation_error_deg']:<22.2f}{eval_metrics['median_rotation_error_deg']:<22.2f}")
+                print(f"{'Rotation RMSE (deg)':<35}{base_metrics['rotation_rmse_deg']:<22.2f}{eval_metrics['rotation_rmse_deg']:<22.2f}")
+                print("=" * 80 + "\n")
 
     def render_4views(geom, out_path, is_mesh=False):
         vis = o3d.visualization.Visualizer()

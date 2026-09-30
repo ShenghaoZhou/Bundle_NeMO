@@ -7,7 +7,7 @@ from PIL import Image
 from typing import Optional, Dict, Any, Tuple, List, Union
 
 from .scale_estimator import AutomaticScaleEstimator
-from .memory_bank import AlignedDynamicNeMOMemoryBank, geodesic_angle_deg
+from .memory_bank import AlignedDynamicNeMOMemoryBank, GrowingNeMOAdapter, geodesic_angle_deg
 from .correspondence import NeMOCorrespondenceEngine
 from .optimizer import BundleNeMOOptimizer
 from .fusion import CanonicalObjectFusion
@@ -109,7 +109,12 @@ class BundleNeMOTracker:
         max_jump_m: float = 0.055,
         max_step_rot_deg: float = 35.0,
         ransac_dist_thresh: float = 0.015,
-        max_icp_dist: float = 0.025
+        max_icp_dist: float = 0.025,
+        use_growing_nemo: bool = False,
+        growing_max_keyframes: int = 10,
+        growing_min_frames_between_updates: int = 4,
+        growing_conf_threshold: float = 0.45,
+        growing_inlier_threshold: float = 0.20
     ):
         self.device = device
         self.model = nemo_model
@@ -118,15 +123,28 @@ class BundleNeMOTracker:
         self.decode_stride = decode_stride
         self.use_icp_refinement = use_icp_refinement
         self.alignment_mode = alignment_mode
+        self.use_growing_nemo = use_growing_nemo
 
         # Core Components
-        self.memory_bank = AlignedDynamicNeMOMemoryBank(
-            model=self.model,
-            device=self.device,
-            min_keyframe_rot_deg=min_keyframe_rot_deg,
-            min_inlier_ratio_trigger=min_inlier_ratio_trigger,
-            min_keyframe_trans_m=min_keyframe_trans_m
-        )
+        if self.use_growing_nemo:
+            self.memory_bank = GrowingNeMOAdapter(
+                model=self.model,
+                device=self.device,
+                max_keyframes=growing_max_keyframes,
+                min_frames_between_updates=growing_min_frames_between_updates,
+                novelty_conf_threshold=growing_conf_threshold,
+                novelty_inlier_threshold=growing_inlier_threshold,
+                num_sample_points=1500,
+                cache_dino_features=True
+            )
+        else:
+            self.memory_bank = AlignedDynamicNeMOMemoryBank(
+                model=self.model,
+                device=self.device,
+                min_keyframe_rot_deg=min_keyframe_rot_deg,
+                min_inlier_ratio_trigger=min_inlier_ratio_trigger,
+                min_keyframe_trans_m=min_keyframe_trans_m
+            )
         self.corres_engine = NeMOCorrespondenceEngine(
             conf_threshold=conf_threshold,
             reprojection_error=reprojection_error_pnp,
@@ -387,105 +405,142 @@ class BundleNeMOTracker:
             T_cam_obj = T_cam_obj_gt.copy()
         self.last_T_cam_obj = T_cam_obj.copy()
 
-        # 5. Check Keyframe Admission (strict rotation/translation delta, cooldown, healthy inliers)
+        # 5. Check Keyframe Admission
         keyframe_added = False
-        pose_for_kf_check = T_cam_obj if self.alignment_mode != "gt" or R_cam_obj_gt is None else R_cam_obj_gt
-        is_gt = (self.alignment_mode == "gt")
-        should_add, reason = self.memory_bank.should_register_keyframe(
-            current_R_cam_obj=pose_for_kf_check,
-            current_inlier_ratio=inlier_ratio,
-            frame_idx=self.frame_count,
-            is_gt_mode=is_gt
-        )
-        if is_gt:
-            kf_admit = should_add
-        else:
-            kf_admit = should_add and success and (inliers is not None and len(inliers) >= 1500)
-
-        if kf_admit:
-            cluster_name = f"Cluster {len(self.memory_bank.clusters)} (Frame {self.frame_count})"
-            selected_crops = [crop_pil]
-
-            if self.alignment_mode == "gt" and (R_cam_obj_gt is not None or T_cam_obj_gt is not None):
-                # Oracle mode: GT camera-object rotation
-                R_kf = R_cam_obj_gt if R_cam_obj_gt is not None else T_cam_obj_gt[:3, :3]
-                R_k_to_0 = self.memory_bank.R_ref0 @ R_kf.T
-            elif self.alignment_mode == "pose_graph":
-                # Method C: BundleSDF-Style Keyframe Pose Graph Optimization & Multi-View BA
-                sub_inl = inliers if (inliers is not None and len(inliers) >= 30) else np.arange(len(pts3d_cand))
-                node_id = self.pose_graph.add_keyframe(
-                    frame_idx=self.frame_count,
-                    T_cam_obj_init=T_cam_obj,
-                    pts3d_canon=pts3d_cand[sub_inl],
-                    pts2d_pixels=pts2d_full[sub_inl],
-                    conf_weights=conf_valid[sub_inl],
-                    K=K
-                )
-                opt_poses = self.pose_graph.optimize()
-                R_kf = opt_poses[node_id][:3, :3]
-                R_k_to_0 = self.memory_bank.R_ref0 @ R_kf.T
-                print(f"[BundleNeMO PoseGraph BA (Method C)] Keyframe {node_id} optimized across {len(self.pose_graph.keyframes)} nodes")
-            else:
-                # Method A + B: Cross-Cluster 3D Tie Points + Surface ICP Refinement
-                tensors = [image_to_tensor(c, device=self.device) for c in selected_crops]
-                imgs_tensor = torch.cat(tensors, dim=0).unsqueeze(0)
-                sample_points = torch.rand(1, 1500, 3, device=self.device) * 2 - 1
-                with torch.no_grad():
-                    n = self.model.encode_images(imgs_tensor, sample_points)
-                    cand_feat3d = n['features_3d'] + self.model.point_encoder(n['surface_points'])
-                    cand_surf = n['surface_points'][0].cpu().numpy()
-
-                R_k_to_0, align_info = self.zero_gt_aligner.estimate_and_refine_cluster_rotation(
-                    keyframe_crop=crop_pil,
-                    memory_bank=self.memory_bank,
-                    fusion=self.fusion,
-                    new_features_3d=cand_feat3d,
-                    new_cluster_surf=cand_surf,
-                    fallback_R=T_cam_obj[:3, :3],
-                    scale=self.metric_scale
-                )
-                R_kf = R_k_to_0.T @ self.memory_bank.R_ref0
-                print(f"[BundleNeMO Zero-GT A+B] {cluster_name} aligned: {align_info}")
-
-            self.memory_bank.add_cluster(
-                name=cluster_name,
-                keyframe_crops=selected_crops,
-                R_cam_obj_kf=R_kf,
-                frame_idx=self.frame_count,
-                R_k_to_0_override=R_k_to_0
+        if self.use_growing_nemo:
+            is_novel, reason, cov = self.memory_bank.check_novelty(
+                dec_out=dec_out,
+                target_crop_mask=crop_mask_fg,
+                inlier_ratio=inlier_ratio,
+                num_inliers=len(inliers) if inliers is not None else 0,
+                pnp_success=success,
+                current_frame_idx=self.frame_count
             )
-            keyframe_added = True
+            if is_novel:
+                self.memory_bank.update(crop_pil, self.frame_count, reason=reason)
+                keyframe_added = True
+                kfs = [k['frame_idx'] for k in self.memory_bank.growing_nemo.keyframe_records]
+                print(f"[BundleNeMO GrowingNeMO] Frame {self.frame_count:04d} admitted (Keyframes: {kfs}): {reason}")
+        else:
+            pose_for_kf_check = T_cam_obj if self.alignment_mode != "gt" or R_cam_obj_gt is None else R_cam_obj_gt
+            is_gt = (self.alignment_mode == "gt")
+            should_add, reason = self.memory_bank.should_register_keyframe(
+                current_R_cam_obj=pose_for_kf_check,
+                current_inlier_ratio=inlier_ratio,
+                frame_idx=self.frame_count,
+                is_gt_mode=is_gt
+            )
+            if is_gt:
+                kf_admit = should_add
+            else:
+                kf_admit = should_add and success and (inliers is not None and len(inliers) >= 1500)
 
-            # Compute exact SE(3) body-to-local transform for newly admitted cluster
-            cl_idx = len(self.memory_bank.clusters) - 1
-            with torch.no_grad():
-                t_single = image_to_tensor(crop_pil, size=224, device=self.device, normalize=False).unsqueeze(1)
-                dec_new = self.model.decode_images(t_single, self.memory_bank.clusters[cl_idx]['features_3d_updated'])
-            pts_new_local = dec_new['pts3d'][0, 0].cpu().numpy()
-            conf_new = dec_new['conf'][0, 0].cpu().numpy()
-            pts2d_kf, pts3d_kf_local, _ = self.corres_engine.extract_correspondences(pts_new_local, conf_new, crop_box)
-            if len(pts3d_kf_local) >= 30:
-                succ_kf, T_cam_local_kf, inl_kf, _ = self.corres_engine.solve_pnp(
-                    pts3d_kf_local * self.metric_scale, pts2d_kf, K
+            if kf_admit:
+                cluster_name = f"Cluster {len(self.memory_bank.clusters)} (Frame {self.frame_count})"
+                selected_crops = [crop_pil]
+
+                if self.alignment_mode == "gt" and (R_cam_obj_gt is not None or T_cam_obj_gt is not None):
+                    # Oracle mode: GT camera-object rotation
+                    R_kf = R_cam_obj_gt if R_cam_obj_gt is not None else T_cam_obj_gt[:3, :3]
+                    R_k_to_0 = self.memory_bank.R_ref0 @ R_kf.T
+                elif self.alignment_mode == "pose_graph":
+                    # Method C: BundleSDF-Style Keyframe Pose Graph Optimization & Multi-View BA
+                    sub_inl = inliers if (inliers is not None and len(inliers) >= 30) else np.arange(len(pts3d_cand))
+                    node_id = self.pose_graph.add_keyframe(
+                        frame_idx=self.frame_count,
+                        T_cam_obj_init=T_cam_obj,
+                        pts3d_canon=pts3d_cand[sub_inl],
+                        pts2d_pixels=pts2d_full[sub_inl],
+                        conf_weights=conf_valid[sub_inl],
+                        K=K
+                    )
+                    opt_poses = self.pose_graph.optimize()
+                    R_kf = opt_poses[node_id][:3, :3]
+                    R_k_to_0 = self.memory_bank.R_ref0 @ R_kf.T
+                    print(f"[BundleNeMO PoseGraph BA (Method C)] Keyframe {node_id} optimized across {len(self.pose_graph.keyframes)} nodes")
+                else:
+                    # Method A + B: Cross-Cluster 3D Tie Points + Surface ICP Refinement
+                    tensors = [image_to_tensor(c, device=self.device) for c in selected_crops]
+                    imgs_tensor = torch.cat(tensors, dim=0).unsqueeze(0)
+                    sample_points = torch.rand(1, 1500, 3, device=self.device) * 2 - 1
+                    with torch.no_grad():
+                        n = self.model.encode_images(imgs_tensor, sample_points)
+                        cand_feat3d = n['features_3d'] + self.model.point_encoder(n['surface_points'])
+                        cand_surf = n['surface_points'][0].cpu().numpy()
+
+                    R_k_to_0, align_info = self.zero_gt_aligner.estimate_and_refine_cluster_rotation(
+                        keyframe_crop=crop_pil,
+                        memory_bank=self.memory_bank,
+                        fusion=self.fusion,
+                        new_features_3d=cand_feat3d,
+                        new_cluster_surf=cand_surf,
+                        fallback_R=T_cam_obj[:3, :3],
+                        scale=self.metric_scale
+                    )
+                    R_kf = R_k_to_0.T @ self.memory_bank.R_ref0
+                    print(f"[BundleNeMO Zero-GT A+B] {cluster_name} aligned: {align_info}")
+
+                self.memory_bank.add_cluster(
+                    name=cluster_name,
+                    keyframe_crops=selected_crops,
+                    R_cam_obj_kf=R_kf,
+                    frame_idx=self.frame_count,
+                    R_k_to_0_override=R_k_to_0
                 )
-                if succ_kf and T_cam_local_kf is not None:
-                    # T_obj_local = T_cam_obj^-1 @ T_cam_local
-                    T_obj_local_k = np.linalg.inv(T_cam_obj) @ T_cam_local_kf
-                    self.memory_bank.clusters[cl_idx]['T_obj_local'] = T_obj_local_k
+                keyframe_added = True
 
-            # Additional ICP refinement if requested and not already done in cross_icp
-            if self.use_icp_refinement and self.alignment_mode != "cross_icp":
+                # Compute exact SE(3) body-to-local transform for newly admitted cluster
                 cl_idx = len(self.memory_bank.clusters) - 1
-                surf = self.memory_bank.clusters[cl_idx]['surface_points']
-                pts_surf_canon = self.memory_bank.get_canonical_3d_points(cl_idx, surf, scale=self.metric_scale)
-                Delta_T = self.fusion.refine_with_icp(pts_surf_canon)
-                Delta_R = Delta_T[:3, :3]
-                if not np.allclose(Delta_R, np.eye(3)):
-                    self.memory_bank.clusters[cl_idx]['R_k_to_0'] = Delta_R @ self.memory_bank.clusters[cl_idx]['R_k_to_0']
-                    print(f"[BundleNeMO] Applied ICP alignment refinement to {cluster_name}")
+                with torch.no_grad():
+                    t_single = image_to_tensor(crop_pil, size=224, device=self.device, normalize=False).unsqueeze(1)
+                    dec_new = self.model.decode_images(t_single, self.memory_bank.clusters[cl_idx]['features_3d_updated'])
+                pts_new_local = dec_new['pts3d'][0, 0].cpu().numpy()
+                conf_new = dec_new['conf'][0, 0].cpu().numpy()
+                pts2d_kf, pts3d_kf_local, _ = self.corres_engine.extract_correspondences(pts_new_local, conf_new, crop_box)
+                if len(pts3d_kf_local) >= 30:
+                    succ_kf, T_cam_local_kf, inl_kf, _ = self.corres_engine.solve_pnp(
+                        pts3d_kf_local * self.metric_scale, pts2d_kf, K
+                    )
+                    if succ_kf and T_cam_local_kf is not None:
+                        # T_obj_local = T_cam_obj^-1 @ T_cam_local
+                        T_obj_local_k = np.linalg.inv(T_cam_obj) @ T_cam_local_kf
+                        self.memory_bank.clusters[cl_idx]['T_obj_local'] = T_obj_local_k
 
-        # 6. Integrate newly added keyframe cluster canonical surface points into Canonical Fusion
-        if keyframe_added and len(self.memory_bank.clusters) > 0:
+                # Additional ICP refinement if requested and not already done in cross_icp
+                if self.use_icp_refinement and self.alignment_mode != "cross_icp":
+                    cl_idx = len(self.memory_bank.clusters) - 1
+                    surf = self.memory_bank.clusters[cl_idx]['surface_points']
+                    pts_surf_canon = self.memory_bank.get_canonical_3d_points(cl_idx, surf, scale=self.metric_scale)
+                    Delta_T = self.fusion.refine_with_icp(pts_surf_canon)
+                    Delta_R = Delta_T[:3, :3]
+                    if not np.allclose(Delta_R, np.eye(3)):
+                        self.memory_bank.clusters[cl_idx]['R_k_to_0'] = Delta_R @ self.memory_bank.clusters[cl_idx]['R_k_to_0']
+                        print(f"[BundleNeMO] Applied ICP alignment refinement to {cluster_name}")
+
+        # 6. Integrate canonical surface points into Canonical Fusion
+        # GrowingNeMO: fuse decoded pts3d_canon EVERY successful frame (matches standalone NeMO behaviour
+        # which accumulates correspondences on all PnP-successful frames, not just keyframe events).
+        # Baseline clusters: fuse the full cluster surface only on keyframe admission events (unchanged).
+        if self.use_growing_nemo and success and len(pts3d_cand) > 0:
+            # pts3d_cand already has scale applied and canonical_alignment applied (from step 2)
+            # Stride-4 subsample to keep fusion budget comparable to standalone NeMO pipeline
+            pts_fuse = pts3d_cand[::4]
+            P_cam = (T_cam_obj[:3, :3] @ pts_fuse.T).T + T_cam_obj[:3, 3]
+            u = np.round(K[0, 0] * P_cam[:, 0] / P_cam[:, 2] + K[0, 2]).astype(int)
+            v = np.round(K[1, 1] * P_cam[:, 1] / P_cam[:, 2] + K[1, 2]).astype(int)
+            H, W = rgb_img.shape[:2]
+            valid = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (P_cam[:, 2] > 0)
+            obj_m = (binary_mask > 0) if foreground_mask is None else ((binary_mask > 0) & (foreground_mask > 0))
+            in_mask = valid & (obj_m[np.clip(v, 0, H-1), np.clip(u, 0, W-1)])
+            colors_per_frame = np.ones((len(pts_fuse), 3), dtype=np.float64) * 0.5
+            if in_mask.sum() > 0:
+                colors_per_frame[in_mask] = rgb_img[v[in_mask], u[in_mask]] / 255.0
+                colors_per_frame[~in_mask] = colors_per_frame[in_mask].mean(axis=0)
+            weights_per_frame = np.ones(len(pts_fuse), dtype=np.float64)
+            weights_per_frame[in_mask] = 2.0
+            self.fusion.integrate_points(pts_fuse, colors_per_frame, weights_per_frame)
+
+        elif keyframe_added and not self.use_growing_nemo and len(self.memory_bank.clusters) > 0:
             cl_idx = len(self.memory_bank.clusters) - 1
             surf = self.memory_bank.clusters[cl_idx]['surface_points']
             pts_canon = self.memory_bank.get_canonical_3d_points(cl_idx, surf, scale=self.metric_scale)

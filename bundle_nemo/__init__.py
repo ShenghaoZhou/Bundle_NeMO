@@ -9,7 +9,7 @@ if os.path.isdir(_submodule_nemo_src) and _submodule_nemo_src not in sys.path:
     sys.path.insert(0, _submodule_nemo_src)
 
 from .tracker import BundleNeMOTracker, crop_masked_object
-from .memory_bank import AlignedDynamicNeMOMemoryBank
+from .memory_bank import AlignedDynamicNeMOMemoryBank, GrowingNeMOAdapter
 from .correspondence import NeMOCorrespondenceEngine
 from .optimizer import BundleNeMOOptimizer
 from .fusion import CanonicalObjectFusion
@@ -21,6 +21,7 @@ __all__ = [
     'BundleNeMOTracker',
     'crop_masked_object',
     'AlignedDynamicNeMOMemoryBank',
+    'GrowingNeMOAdapter',
     'NeMOCorrespondenceEngine',
     'BundleNeMOOptimizer',
     'CanonicalObjectFusion',

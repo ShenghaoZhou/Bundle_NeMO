@@ -267,3 +267,127 @@ class AlignedDynamicNeMOMemoryBank:
             pts_canon = np.matmul(pts_canon, self.R_canon_align.T)
 
         return pts_canon * scale
+
+
+class GrowingNeMOAdapter:
+    """
+    Adapter bridging GrowingNeMO to BundleNeMOTracker.
+    Replaces disjoint cluster memory bank with unified multi-view CrossViewEncoder memory.
+    """
+    def __init__(
+        self,
+        model,
+        device: torch.device,
+        max_keyframes: int = 10,
+        min_frames_between_updates: int = 4,
+        novelty_conf_threshold: float = 0.45,
+        novelty_inlier_threshold: float = 0.20,
+        num_sample_points: int = 1500,
+        cache_dino_features: bool = True
+    ):
+        # Import GrowingNeMO from NeMO
+        try:
+            from growing_nemo import GrowingNeMO
+        except ImportError:
+            from NeMO.growing_nemo import GrowingNeMO
+
+        self.growing_nemo = GrowingNeMO(
+            model=model,
+            device=device,
+            max_keyframes=max_keyframes,
+            min_frames_between_updates=min_frames_between_updates,
+            novelty_conf_threshold=novelty_conf_threshold,
+            novelty_inlier_threshold=novelty_inlier_threshold,
+            num_sample_points=num_sample_points,
+            cache_dino_features=cache_dino_features
+        )
+        self.model = model
+        self.device = device
+        self.R_canon_align: Optional[np.ndarray] = None
+        self.R_ref0: Optional[np.ndarray] = None
+        self.c0: Optional[np.ndarray] = None
+        self.is_initialized: bool = False
+
+    @property
+    def clusters(self) -> List[Dict[str, Any]]:
+        """Return a lightweight proxy cluster for tracker and fusion compatibility."""
+        if self.growing_nemo.surface_points is not None:
+            last_idx = self.growing_nemo.keyframe_records[-1]['frame_idx'] if self.growing_nemo.keyframe_records else 0
+            return [{
+                'name': f'GrowingNeMO_Unified (K={len(self.growing_nemo.keyframe_records)})',
+                'frame_idx': last_idx,
+                'surface_points': self.growing_nemo.surface_points,
+                'center': np.mean(self.growing_nemo.surface_points, axis=0),
+                'R_k_to_0': np.eye(3),
+                'R_cam_obj': self.R_ref0 if self.R_ref0 is not None else np.eye(3),
+                'features_3d_updated': self.growing_nemo.features_3d_updated
+            }]
+        return []
+
+    def initialize_reference(self, R_cam_obj_0: np.ndarray):
+        """Anchor canonical reference orientation to initial frame object pose."""
+        self.R_ref0 = R_cam_obj_0.copy()
+
+    def set_canonical_alignment(self, R_align: np.ndarray):
+        """Set alignment matrix from NeMO canonical space to physical model body frame."""
+        self.R_canon_align = R_align.copy()
+
+    def add_cluster(self, name: str, keyframe_crops: List[Image.Image], R_cam_obj_kf: Optional[np.ndarray] = None, frame_idx: int = 0, **kwargs):
+        """Initialize or update GrowingNeMO with new keyframe views."""
+        if not self.is_initialized:
+            self.growing_nemo.initialize(keyframe_crops, [frame_idx] * len(keyframe_crops))
+            self.is_initialized = True
+            if self.growing_nemo.surface_points is not None:
+                self.c0 = np.mean(self.growing_nemo.surface_points, axis=0)
+        else:
+            for crop in keyframe_crops:
+                self.growing_nemo.update(crop, frame_idx, reason=name)
+
+    def decode_query(
+        self,
+        query_img_pil: Image.Image,
+        query_mask_crop: Optional[np.ndarray] = None,
+        prior_R_cam_obj: Optional[np.ndarray] = None
+    ) -> Tuple[Dict[str, torch.Tensor], int]:
+        """Decode query image against unified GrowingNeMO memory in a single forward pass."""
+        dec_out = self.growing_nemo.decode(query_img_pil)
+        return dec_out, 0
+
+    def get_canonical_3d_points(
+        self,
+        cluster_idx: int,
+        pts3d_local: np.ndarray,
+        scale: float = 1.0
+    ) -> np.ndarray:
+        """
+        Transform GrowingNeMO 3D predictions to physical canonical coordinates.
+        GrowingNeMO coordinates are natively canonical. Rotates by R_canon_align if calibrated.
+        """
+        pts = pts3d_local
+        if self.R_canon_align is not None:
+            pts = np.matmul(pts, self.R_canon_align.T)
+        return pts * scale
+
+    def check_novelty(
+        self,
+        dec_out: Dict[str, torch.Tensor],
+        target_crop_mask: Optional[np.ndarray],
+        inlier_ratio: float,
+        num_inliers: int,
+        pnp_success: bool,
+        current_frame_idx: int
+    ) -> Tuple[bool, str, float]:
+        """Delegate novelty detection to GrowingNeMO."""
+        return self.growing_nemo.check_novelty(
+            dec_out=dec_out,
+            target_crop_mask=target_crop_mask,
+            inlier_ratio=inlier_ratio,
+            num_inliers=num_inliers,
+            pnp_success=pnp_success,
+            current_frame_idx=current_frame_idx
+        )
+
+    def update(self, crop_pil: Image.Image, current_frame_idx: int, reason: str = "novelty"):
+        """Delegate keyframe addition and memory re-encoding to GrowingNeMO."""
+        self.growing_nemo.update(crop_pil, current_frame_idx, reason=reason)
+
