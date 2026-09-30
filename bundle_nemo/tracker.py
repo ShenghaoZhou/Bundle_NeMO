@@ -387,7 +387,7 @@ class BundleNeMOTracker:
 
         # 3. Solve Coarse PnP
         success, T_pnp, inliers, inlier_ratio = self.corres_engine.solve_pnp(
-            pts3d_cand, pts2d_full, K
+            pts3d_cand, pts2d_full, K, prior_T=self.last_T_cam_obj
         )
 
         # 4. Refine with Optimizer (strictly on verified geometric inliers)
@@ -421,6 +421,39 @@ class BundleNeMOTracker:
                 keyframe_added = True
                 kfs = [k['frame_idx'] for k in self.memory_bank.growing_nemo.keyframe_records]
                 print(f"[BundleNeMO GrowingNeMO] Frame {self.frame_count:04d} admitted (Keyframes: {kfs}): {reason}")
+
+                # Re-decode immediately with updated unified memory so this frame benefits
+                # from its own newly absorbed viewpoint (eliminates 1-frame glitches on keyframe admission)
+                dec_out_ref, _ = self.memory_bank.decode_query(crop_pil, query_mask_crop=crop_mask_fg)
+                pts3d_local_ref = dec_out_ref['pts3d'][0, 0].cpu().numpy()
+                conf_ref = dec_out_ref['conf'][0, 0].cpu().numpy()
+                pts3d_canon_ref = self.memory_bank.get_canonical_3d_points(
+                    cluster_idx=0,
+                    pts3d_local=pts3d_local_ref,
+                    scale=self.metric_scale
+                )
+                pts2d_full_ref, pts3d_cand_ref, conf_valid_ref = self.corres_engine.extract_correspondences(
+                    pts3d_canon_ref, conf_ref, crop_box
+                )
+                succ_ref, T_pnp_ref, inl_ref, inlier_ratio_ref = self.corres_engine.solve_pnp(
+                    pts3d_cand_ref, pts2d_full_ref, K, prior_T=self.last_T_cam_obj
+                )
+                if succ_ref:
+                    opt_res_ref = self.optimizer.optimize_step(
+                        K=K,
+                        pts3d_canon=pts3d_cand_ref,
+                        pts2d_pixels=pts2d_full_ref,
+                        conf_weights=conf_valid_ref,
+                        T_cam_obj_pnp=T_pnp_ref,
+                        pnp_valid=True,
+                        inliers=inl_ref
+                    )
+                    T_cam_obj = opt_res_ref['T_cam_obj']
+                    self.last_T_cam_obj = T_cam_obj.copy()
+                    pts3d_cand = pts3d_cand_ref
+                    success = True
+                    inliers = inl_ref
+                    inlier_ratio = inlier_ratio_ref
         else:
             pose_for_kf_check = T_cam_obj if self.alignment_mode != "gt" or R_cam_obj_gt is None else R_cam_obj_gt
             is_gt = (self.alignment_mode == "gt")

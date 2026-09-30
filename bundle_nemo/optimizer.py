@@ -180,15 +180,19 @@ class KinematicStateFilter:
 
             # Smoothly update velocity state
             step_pos = self.pos - old_pos
-            self.vel_pos = 0.7 * self.vel_pos + 0.3 * step_pos
-            step_rot = old_rot.T @ self.rot
-            self.vel_rot = step_rot
+            if is_spike:
+                self.vel_pos = np.zeros(3, dtype=np.float64)
+                self.vel_rot = np.eye(3, dtype=np.float64)
+            else:
+                self.vel_pos = 0.7 * self.vel_pos + 0.3 * step_pos
+                self.vel_rot = old_rot.T @ self.rot
         else:
-            # Kinematic constant-velocity forward extrapolation
+            # Kinematic damping forward extrapolation (zero angular spin, decayed velocity)
             is_spike = True
             self.spike_count += 1
-            self.pos = self.pos + self.vel_pos
-            self.rot = self.rot @ self.vel_rot
+            self.pos = self.pos + 0.5 * self.vel_pos
+            self.vel_pos = 0.5 * self.vel_pos
+            self.vel_rot = np.eye(3, dtype=np.float64)
 
         T_out = np.eye(4, dtype=np.float64)
         T_out[:3, :3] = self.rot
@@ -255,11 +259,8 @@ class BundleNeMOOptimizer:
         T_filt = filt_res['T_cam_obj']
         is_spike = filt_res['is_spike']
 
-        # If a kinematic clamp occurred but PnP was valid, use PnP measurement as init for BA
-        if is_spike and pnp_valid and T_cam_obj_pnp is not None:
-            T_init = T_cam_obj_pnp
-        else:
-            T_init = T_filt
+        # Initialize bundle adjustment from the filtered kinematic pose to prevent latching onto spikes
+        T_init = T_filt
 
         # Filter strictly by PnP inliers if available
         if inliers is not None and len(inliers) >= 15:
@@ -318,8 +319,8 @@ class BundleNeMOOptimizer:
 
             if torch.isfinite(best_T).all():
                 T_opt = best_T.cpu().numpy()
-                # If BA was initialized from PnP during spike or converged well, resync filter to clear lag
-                if is_spike:
+                # Only resync filter state if the pose did not violate kinematic bounds
+                if not is_spike:
                     self.filter.resync(T_opt)
             else:
                 T_opt = T_init
